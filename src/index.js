@@ -1,12 +1,13 @@
 import 'dotenv/config';
+import http from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { createServer as createHttpServer } from 'node:http';
+import express from 'express';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import { CookieJar } from 'tough-cookie';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
 const BASE_URL = process.env.CAEZ_BASE_URL;
@@ -19,6 +20,8 @@ const LOGIN_USER_FIELD = process.env.CAEZ_LOGIN_USER_FIELD || 'username';
 const LOGIN_PASSWORD_FIELD = process.env.CAEZ_LOGIN_PASSWORD_FIELD || 'password';
 const LOGIN_EXTRA_FIELDS = safeParseJson(process.env.CAEZ_LOGIN_EXTRA_FIELDS, {});
 const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '';
+const PORT = Number(process.env.PORT || 3000);
+const MCP_PATH = process.env.MCP_PATH || '/mcp';
 
 if (!BASE_URL) {
   throw new Error('Falta CAEZ_BASE_URL en las variables de entorno.');
@@ -32,6 +35,7 @@ const TRUSTED_ORIGINS = Array.from(new Set(
 
 const cookieJar = new CookieJar();
 let authenticated = false;
+const transports = new Map();
 
 function safeParseJson(value, fallback) {
   if (!value) return fallback;
@@ -103,7 +107,6 @@ async function request(url, options = {}) {
   });
 
   assertTrustedOrigin(response.url || finalUrl);
-
   await storeSetCookie(finalUrl, response);
   return response;
 }
@@ -300,6 +303,24 @@ async function fetchPage(urlOrPath) {
   return { html, finalUrl };
 }
 
+function mcpError(error) {
+  const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          error: {
+            code: message.split(':')[0],
+            message
+          }
+        }, null, 2)
+      }
+    ],
+    isError: true
+  };
+}
+
 function createMcpServer() {
   const server = new McpServer({
     name: 'ia-cae-zurekin-mcp',
@@ -466,111 +487,154 @@ function createMcpServer() {
   return server;
 }
 
-function mcpError(error) {
-  const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
-  return {
-    content: [
-      {
-        type: 'text',
-        text: JSON.stringify({
-          error: {
-            code: message.split(':')[0],
-            message
-          }
-        }, null, 2)
-      }
-    ],
-    isError: true
-  };
+function isInitializeRequest(body) {
+  return body?.method === 'initialize';
 }
 
-function setCorsHeaders(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Protocol-Version');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-}
-
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-
-    req.on('end', () => {
-      if (!body) {
-        resolve({});
-        return;
-      }
-
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        reject(new Error('INVALID_JSON'));
-      }
-    });
-
-    req.on('error', reject);
+async function createTransportSession() {
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sessionId) => {
+      transports.set(sessionId, { transport, server });
+    }
   });
+
+  transport.onclose = async () => {
+    if (transport.sessionId) {
+      transports.delete(transport.sessionId);
+    }
+    await server.close();
+  };
+
+  await server.connect(transport);
+  return { transport, server };
+}
+
+function getSessionId(req) {
+  return req.header('mcp-session-id') || req.header('Mcp-Session-Id') || null;
 }
 
 async function startHttpServer() {
-  const port = Number(process.env.PORT || 3000);
-  const httpServer = createHttpServer(async (req, res) => {
-    setCorsHeaders(res);
+  const app = express();
+  app.use(express.json({ limit: '1mb' }));
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204).end();
-      return;
-    }
-
-    if (req.method === 'GET' && req.url === '/') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        name: 'ia-cae-zurekin-mcp',
-        status: 'ok',
-        endpoint: '/mcp'
-      }));
-      return;
-    }
-
-    if (req.method !== 'POST' || req.url !== '/mcp') {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: {
-          code: 'NOT_FOUND',
-          message: 'Usa POST /mcp para las peticiones MCP.'
-        }
-      }));
-      return;
-    }
-
+  app.get('/health', async (_req, res) => {
     try {
-      const body = await readJsonBody(req);
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        enableJsonResponse: true
+      await ensureAuthenticated();
+      res.json({ ok: true, authenticated: true, base_url: BASE_URL, mcp_path: MCP_PATH });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'INTERNAL_ERROR',
+        base_url: BASE_URL,
+        mcp_path: MCP_PATH
       });
-      const server = createMcpServer();
-      await server.connect(transport);
-      await transport.handleRequest(req, res, body);
+    }
+  });
+
+  app.get('/', (_req, res) => {
+    res.json({
+      name: 'ia-cae-zurekin-mcp',
+      status: 'ok',
+      endpoint: MCP_PATH,
+      healthcheck: '/health'
+    });
+  });
+
+  app.get(MCP_PATH, (_req, res) => {
+    res.status(405).json({
+      error: {
+        code: 'METHOD_NOT_ALLOWED',
+        message: `Usa POST ${MCP_PATH} para las peticiones MCP.`
+      }
+    });
+  });
+
+  app.post(MCP_PATH, async (req, res) => {
+    try {
+      const sessionId = getSessionId(req);
+      let session = sessionId ? transports.get(sessionId) : null;
+
+      if (!session) {
+        if (sessionId) {
+          res.status(404).json({
+            error: {
+              code: 'SESSION_NOT_FOUND',
+              message: 'La sesión MCP no existe o ha caducado.'
+            }
+          });
+          return;
+        }
+
+        if (!isInitializeRequest(req.body)) {
+          res.status(400).json({
+            error: {
+              code: 'INVALID_REQUEST',
+              message: 'La primera petición MCP debe ser initialize.'
+            }
+          });
+          return;
+        }
+
+        session = await createTransportSession();
+      }
+
+      await session.transport.handleRequest(req, res, req.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
       if (!res.headersSent) {
-        res.writeHead(message === 'INVALID_JSON' ? 400 : 500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
+        res.status(500).json({
           error: {
-            code: message,
+            code: 'INTERNAL_ERROR',
             message
           }
-        }));
+        });
       }
     }
   });
 
-  httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`IA CAE Zurekin MCP escuchando en HTTP en el puerto ${port}`);
+  app.delete(MCP_PATH, async (req, res) => {
+    try {
+      const sessionId = getSessionId(req);
+      const session = sessionId ? transports.get(sessionId) : null;
+
+      if (!session) {
+        res.status(404).json({
+          error: {
+            code: 'SESSION_NOT_FOUND',
+            message: 'No se encontró la sesión MCP indicada.'
+          }
+        });
+        return;
+      }
+
+      await session.transport.handleRequest(req, res);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: {
+            code: 'INTERNAL_ERROR',
+            message
+          }
+        });
+      }
+    }
+  });
+
+  app.use((_req, res) => {
+    res.status(404).json({
+      error: {
+        code: 'NOT_FOUND',
+        message: `Ruta no encontrada. Usa ${MCP_PATH} para MCP y /health para comprobar el servidor.`
+      }
+    });
+  });
+
+  const httpServer = http.createServer(app);
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`IA CAE Zurekin MCP escuchando en http://0.0.0.0:${PORT}${MCP_PATH}`);
   });
 }
 
