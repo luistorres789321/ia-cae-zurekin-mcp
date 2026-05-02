@@ -16,18 +16,17 @@ const LOGIN_USER_FIELD = process.env.CAEZ_LOGIN_USER_FIELD || 'username';
 const LOGIN_PASSWORD_FIELD = process.env.CAEZ_LOGIN_PASSWORD_FIELD || 'password';
 const LOGIN_EXTRA_FIELDS = safeParseJson(process.env.CAEZ_LOGIN_EXTRA_FIELDS, {});
 const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '';
-const MAX_SEARCH_PAGES = Number.parseInt(process.env.CAEZ_MAX_SEARCH_PAGES || '25', 10);
 
 if (!BASE_URL) {
   throw new Error('Falta CAEZ_BASE_URL en las variables de entorno.');
 }
 
-const BASE_ORIGIN = new URL(BASE_URL).origin;
-const BASE_URL_OBJECT = new URL(BASE_URL);
-const BASE_PATH_PREFIX = BASE_URL_OBJECT.pathname.replace(/\/$/, '').toLowerCase();
-const BASE_DIRECTORY = BASE_URL_OBJECT.pathname.endsWith('/')
-  ? BASE_URL_OBJECT.pathname
-  : BASE_URL_OBJECT.pathname.replace(/[^/]+$/, '');
+const TRUSTED_ORIGINS = Array.from(new Set(
+  [BASE_URL, LOGIN_URL]
+    .filter(Boolean)
+    .map((url) => new URL(url).origin)
+));
+
 const cookieJar = new CookieJar();
 let authenticated = false;
 
@@ -48,31 +47,11 @@ function normalizeUrl(input) {
   }
 }
 
-function normalizeSitePath(input) {
-  if (!input) return '';
-  if (/^https?:\/\//i.test(input)) return input;
-  if (input.startsWith('/')) {
-    return new URL(`${BASE_DIRECTORY}${input.slice(1)}`, BASE_URL).toString();
-  }
-  return new URL(input, BASE_URL).toString();
-}
-
 function getPathname(input) {
   try {
     return new URL(input, BASE_URL).pathname.toLowerCase();
   } catch {
     return '';
-  }
-}
-
-function urlBelongsToSite(input) {
-  try {
-    const url = new URL(input, BASE_URL);
-    const pathname = url.pathname.replace(/\/$/, '').toLowerCase();
-    return url.origin === BASE_ORIGIN
-      && (pathname === BASE_PATH_PREFIX || pathname.startsWith(`${BASE_PATH_PREFIX}/`));
-  } catch {
-    return false;
   }
 }
 
@@ -86,6 +65,15 @@ function isLikelyLoginUrl(url) {
     || pathname.includes('login')
     || pathname.includes('signin')
     || pathname.includes('auth');
+}
+
+function assertTrustedOrigin(url) {
+  const origin = new URL(url).origin;
+  if (!TRUSTED_ORIGINS.includes(origin)) {
+    throw new Error(
+      `UNEXPECTED_ORIGIN: el servidor respondió desde ${origin}, pero este conector solo acepta ${TRUSTED_ORIGINS.join(', ')}`
+    );
+  }
 }
 
 async function getCookieHeader(url) {
@@ -110,6 +98,8 @@ async function request(url, options = {}) {
     ...options,
     headers
   });
+
+  assertTrustedOrigin(response.url || finalUrl);
 
   await storeSetCookie(finalUrl, response);
   return response;
@@ -166,7 +156,7 @@ function buildLoginActionUrl(action) {
     ...Object.fromEntries(Object.entries(LOGIN_EXTRA_FIELDS).map(([key, value]) => [key, String(value)]))
   });
 
-  return `${normalizeSitePath(LOGIN_ENDPOINT)}?${params.toString()}`;
+  return `${LOGIN_ENDPOINT}?${params.toString()}`;
 }
 
 async function runLoginAction(action) {
@@ -245,7 +235,7 @@ function extractReadableContent(html, pageUrl) {
     if (!href) return;
     try {
       const url = new URL(href, pageUrl).toString();
-      if (urlBelongsToSite(url)) {
+      if (url.startsWith(BASE_URL)) {
         links.push({ label: label || url, url });
       }
     } catch {
@@ -270,81 +260,6 @@ function dedupeLinks(links) {
     seen.add(link.url);
     return true;
   });
-}
-
-function scoreSearchMatch(text, query) {
-  const haystack = text.toLowerCase();
-  const needle = query.toLowerCase().trim();
-  if (!needle) return 0;
-  if (haystack.includes(needle)) return 1;
-
-  const terms = needle.split(/\s+/).filter(Boolean);
-  if (!terms.length) return 0;
-
-  const matched = terms.filter((term) => haystack.includes(term)).length;
-  return matched / terms.length;
-}
-
-function buildSnippet(text, query, maxLength = 240) {
-  if (!text) return '';
-  const normalizedText = text.replace(/\s+/g, ' ').trim();
-  const index = normalizedText.toLowerCase().indexOf(query.toLowerCase());
-
-  if (index === -1) {
-    return normalizedText.slice(0, maxLength);
-  }
-
-  const start = Math.max(0, index - Math.floor(maxLength / 3));
-  const end = Math.min(normalizedText.length, start + maxLength);
-  return normalizedText.slice(start, end).trim();
-}
-
-async function searchByCrawling(rootTarget, query, limit) {
-  const queue = [rootTarget];
-  const visited = new Set();
-  const results = [];
-
-  while (queue.length && visited.size < MAX_SEARCH_PAGES && results.length < limit) {
-    const target = queue.shift();
-    const normalizedTarget = normalizeUrl(target);
-    if (visited.has(normalizedTarget) || !urlBelongsToSite(normalizedTarget)) continue;
-    visited.add(normalizedTarget);
-
-    let page;
-    try {
-      page = await fetchPage(normalizedTarget);
-    } catch {
-      continue;
-    }
-
-    const extracted = extractReadableContent(page.html, page.finalUrl);
-    const combinedText = [
-      extracted.title,
-      extracted.contentText,
-      extracted.links.map((link) => link.label).join(' ')
-    ].join(' ');
-    const score = scoreSearchMatch(combinedText, query);
-
-    if (score > 0) {
-      results.push({
-        title: extracted.title,
-        url: page.finalUrl,
-        path: new URL(page.finalUrl).pathname,
-        snippet: buildSnippet(extracted.contentText, query),
-        score
-      });
-    }
-
-    for (const link of extracted.links) {
-      if (!visited.has(link.url)) {
-        queue.push(link.url);
-      }
-    }
-  }
-
-  return results
-    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
-    .slice(0, limit);
 }
 
 function extractTables(html) {
@@ -398,7 +313,7 @@ server.tool(
   async ({ query, limit, section }) => {
     try {
       const searchUrl = SEARCH_PATH
-        ? `${normalizeSitePath(SEARCH_PATH)}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
+        ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
         : section || '/';
 
       const { html, finalUrl } = await fetchPage(searchUrl);
@@ -412,7 +327,7 @@ server.tool(
         if (!title || !href) return;
         const snippet = $(el).parent().text().trim().slice(0, 240);
         const url = normalizeUrl(href);
-        if (!urlBelongsToSite(url)) return;
+        if (!url.startsWith(BASE_URL)) return;
         if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
         results.push({
           title,
@@ -422,11 +337,6 @@ server.tool(
           score: 0.5
         });
       });
-
-      if (!results.length) {
-        const crawledResults = await searchByCrawling(searchUrl, query, limit);
-        results.push(...crawledResults);
-      }
 
       return {
         content: [
@@ -527,7 +437,7 @@ server.tool(
         const href = $(el).attr('href');
         if (!title || !href) return;
         const url = normalizeUrl(href);
-        if (!urlBelongsToSite(url)) return;
+        if (!url.startsWith(BASE_URL)) return;
         sections.push({
           title,
           path: new URL(url).pathname,
