@@ -1,9 +1,12 @@
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import { CookieJar } from 'tough-cookie';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 const BASE_URL = process.env.CAEZ_BASE_URL;
@@ -16,18 +19,17 @@ const LOGIN_USER_FIELD = process.env.CAEZ_LOGIN_USER_FIELD || 'username';
 const LOGIN_PASSWORD_FIELD = process.env.CAEZ_LOGIN_PASSWORD_FIELD || 'password';
 const LOGIN_EXTRA_FIELDS = safeParseJson(process.env.CAEZ_LOGIN_EXTRA_FIELDS, {});
 const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '';
-const MAX_SEARCH_PAGES = Number.parseInt(process.env.CAEZ_MAX_SEARCH_PAGES || '25', 10);
 
 if (!BASE_URL) {
   throw new Error('Falta CAEZ_BASE_URL en las variables de entorno.');
 }
 
-const BASE_ORIGIN = new URL(BASE_URL).origin;
-const BASE_URL_OBJECT = new URL(BASE_URL);
-const BASE_PATH_PREFIX = BASE_URL_OBJECT.pathname.replace(/\/$/, '').toLowerCase();
-const BASE_DIRECTORY = BASE_URL_OBJECT.pathname.endsWith('/')
-  ? BASE_URL_OBJECT.pathname
-  : BASE_URL_OBJECT.pathname.replace(/[^/]+$/, '');
+const TRUSTED_ORIGINS = Array.from(new Set(
+  [BASE_URL, LOGIN_URL]
+    .filter(Boolean)
+    .map((url) => new URL(url).origin)
+));
+
 const cookieJar = new CookieJar();
 let authenticated = false;
 
@@ -48,31 +50,11 @@ function normalizeUrl(input) {
   }
 }
 
-function normalizeSitePath(input) {
-  if (!input) return '';
-  if (/^https?:\/\//i.test(input)) return input;
-  if (input.startsWith('/')) {
-    return new URL(`${BASE_DIRECTORY}${input.slice(1)}`, BASE_URL).toString();
-  }
-  return new URL(input, BASE_URL).toString();
-}
-
 function getPathname(input) {
   try {
     return new URL(input, BASE_URL).pathname.toLowerCase();
   } catch {
     return '';
-  }
-}
-
-function urlBelongsToSite(input) {
-  try {
-    const url = new URL(input, BASE_URL);
-    const pathname = url.pathname.replace(/\/$/, '').toLowerCase();
-    return url.origin === BASE_ORIGIN
-      && (pathname === BASE_PATH_PREFIX || pathname.startsWith(`${BASE_PATH_PREFIX}/`));
-  } catch {
-    return false;
   }
 }
 
@@ -86,6 +68,15 @@ function isLikelyLoginUrl(url) {
     || pathname.includes('login')
     || pathname.includes('signin')
     || pathname.includes('auth');
+}
+
+function assertTrustedOrigin(url) {
+  const origin = new URL(url).origin;
+  if (!TRUSTED_ORIGINS.includes(origin)) {
+    throw new Error(
+      `UNEXPECTED_ORIGIN: el servidor respondió desde ${origin}, pero este conector solo acepta ${TRUSTED_ORIGINS.join(', ')}`
+    );
+  }
 }
 
 async function getCookieHeader(url) {
@@ -110,6 +101,8 @@ async function request(url, options = {}) {
     ...options,
     headers
   });
+
+  assertTrustedOrigin(response.url || finalUrl);
 
   await storeSetCookie(finalUrl, response);
   return response;
@@ -166,7 +159,7 @@ function buildLoginActionUrl(action) {
     ...Object.fromEntries(Object.entries(LOGIN_EXTRA_FIELDS).map(([key, value]) => [key, String(value)]))
   });
 
-  return `${normalizeSitePath(LOGIN_ENDPOINT)}?${params.toString()}`;
+  return `${LOGIN_ENDPOINT}?${params.toString()}`;
 }
 
 async function runLoginAction(action) {
@@ -245,7 +238,7 @@ function extractReadableContent(html, pageUrl) {
     if (!href) return;
     try {
       const url = new URL(href, pageUrl).toString();
-      if (urlBelongsToSite(url)) {
+      if (url.startsWith(BASE_URL)) {
         links.push({ label: label || url, url });
       }
     } catch {
@@ -270,81 +263,6 @@ function dedupeLinks(links) {
     seen.add(link.url);
     return true;
   });
-}
-
-function scoreSearchMatch(text, query) {
-  const haystack = text.toLowerCase();
-  const needle = query.toLowerCase().trim();
-  if (!needle) return 0;
-  if (haystack.includes(needle)) return 1;
-
-  const terms = needle.split(/\s+/).filter(Boolean);
-  if (!terms.length) return 0;
-
-  const matched = terms.filter((term) => haystack.includes(term)).length;
-  return matched / terms.length;
-}
-
-function buildSnippet(text, query, maxLength = 240) {
-  if (!text) return '';
-  const normalizedText = text.replace(/\s+/g, ' ').trim();
-  const index = normalizedText.toLowerCase().indexOf(query.toLowerCase());
-
-  if (index === -1) {
-    return normalizedText.slice(0, maxLength);
-  }
-
-  const start = Math.max(0, index - Math.floor(maxLength / 3));
-  const end = Math.min(normalizedText.length, start + maxLength);
-  return normalizedText.slice(start, end).trim();
-}
-
-async function searchByCrawling(rootTarget, query, limit) {
-  const queue = [rootTarget];
-  const visited = new Set();
-  const results = [];
-
-  while (queue.length && visited.size < MAX_SEARCH_PAGES && results.length < limit) {
-    const target = queue.shift();
-    const normalizedTarget = normalizeUrl(target);
-    if (visited.has(normalizedTarget) || !urlBelongsToSite(normalizedTarget)) continue;
-    visited.add(normalizedTarget);
-
-    let page;
-    try {
-      page = await fetchPage(normalizedTarget);
-    } catch {
-      continue;
-    }
-
-    const extracted = extractReadableContent(page.html, page.finalUrl);
-    const combinedText = [
-      extracted.title,
-      extracted.contentText,
-      extracted.links.map((link) => link.label).join(' ')
-    ].join(' ');
-    const score = scoreSearchMatch(combinedText, query);
-
-    if (score > 0) {
-      results.push({
-        title: extracted.title,
-        url: page.finalUrl,
-        path: new URL(page.finalUrl).pathname,
-        snippet: buildSnippet(extracted.contentText, query),
-        score
-      });
-    }
-
-    for (const link of extracted.links) {
-      if (!visited.has(link.url)) {
-        queue.push(link.url);
-      }
-    }
-  }
-
-  return results
-    .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
-    .slice(0, limit);
 }
 
 function extractTables(html) {
@@ -382,172 +300,171 @@ async function fetchPage(urlOrPath) {
   return { html, finalUrl };
 }
 
-const server = new McpServer({
-  name: 'ia-cae-zurekin-mcp',
-  version: '1.0.0'
-});
+function createMcpServer() {
+  const server = new McpServer({
+    name: 'ia-cae-zurekin-mcp',
+    version: '1.0.0'
+  });
 
-server.tool(
-  'search_pages',
-  'Busca contenido dentro de la web interna autenticada.',
-  {
-    query: z.string(),
-    limit: z.number().int().min(1).max(20).default(10),
-    section: z.string().optional()
-  },
-  async ({ query, limit, section }) => {
-    try {
-      const searchUrl = SEARCH_PATH
-        ? `${normalizeSitePath(SEARCH_PATH)}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
-        : section || '/';
+  server.tool(
+    'search_pages',
+    'Busca contenido dentro de la web interna autenticada.',
+    {
+      query: z.string(),
+      limit: z.number().int().min(1).max(20).default(10),
+      section: z.string().optional()
+    },
+    async ({ query, limit, section }) => {
+      try {
+        const searchUrl = SEARCH_PATH
+          ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
+          : section || '/';
 
-      const { html, finalUrl } = await fetchPage(searchUrl);
-      const $ = cheerio.load(html);
-      const results = [];
+        const { html, finalUrl } = await fetchPage(searchUrl);
+        const $ = cheerio.load(html);
+        const results = [];
 
-      $('a[href]').each((_, el) => {
-        if (results.length >= limit) return false;
-        const title = $(el).text().trim();
-        const href = $(el).attr('href');
-        if (!title || !href) return;
-        const snippet = $(el).parent().text().trim().slice(0, 240);
-        const url = normalizeUrl(href);
-        if (!urlBelongsToSite(url)) return;
-        if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
-        results.push({
-          title,
-          url,
-          path: new URL(url).pathname,
-          snippet,
-          score: 0.5
+        $('a[href]').each((_, el) => {
+          if (results.length >= limit) return false;
+          const title = $(el).text().trim();
+          const href = $(el).attr('href');
+          if (!title || !href) return;
+          const snippet = $(el).parent().text().trim().slice(0, 240);
+          const url = normalizeUrl(href);
+          if (!url.startsWith(BASE_URL)) return;
+          if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
+          results.push({
+            title,
+            url,
+            path: new URL(url).pathname,
+            snippet,
+            score: 0.5
+          });
         });
-      });
 
-      if (!results.length) {
-        const crawledResults = await searchByCrawling(searchUrl, query, limit);
-        results.push(...crawledResults);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ results, total: results.length, searched_from: finalUrl }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
       }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ results, total: results.length, searched_from: finalUrl }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
     }
-  }
-);
+  );
 
-server.tool(
-  'get_page',
-  'Obtiene una página concreta del sitio.',
-  {
-    url: z.string().optional(),
-    path: z.string().optional()
-  },
-  async ({ url, path }) => {
-    try {
-      if (!url && !path) throw new Error('INVALID_URL');
-      const target = url || path;
-      const { html, finalUrl } = await fetchPage(target);
-      const extracted = extractReadableContent(html, finalUrl);
+  server.tool(
+    'get_page',
+    'Obtiene una página concreta del sitio.',
+    {
+      url: z.string().optional(),
+      path: z.string().optional()
+    },
+    async ({ url, path }) => {
+      try {
+        if (!url && !path) throw new Error('INVALID_URL');
+        const target = url || path;
+        const { html, finalUrl } = await fetchPage(target);
+        const extracted = extractReadableContent(html, finalUrl);
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              title: extracted.title,
-              url: finalUrl,
-              path: new URL(finalUrl).pathname,
-              content_text: extracted.contentText,
-              content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
-              links: extracted.links
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                title: extracted.title,
+                url: finalUrl,
+                path: new URL(finalUrl).pathname,
+                content_text: extracted.contentText,
+                content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
+                links: extracted.links
+              }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
 
-server.tool(
-  'extract_page_content',
-  'Extrae el contenido estructurado de una página.',
-  {
-    url: z.string(),
-    include_tables: z.boolean().default(true),
-    include_links: z.boolean().default(true)
-  },
-  async ({ url, include_tables, include_links }) => {
-    try {
-      const { html, finalUrl } = await fetchPage(url);
-      const extracted = extractReadableContent(html, finalUrl);
+  server.tool(
+    'extract_page_content',
+    'Extrae el contenido estructurado de una página.',
+    {
+      url: z.string(),
+      include_tables: z.boolean().default(true),
+      include_links: z.boolean().default(true)
+    },
+    async ({ url, include_tables, include_links }) => {
+      try {
+        const { html, finalUrl } = await fetchPage(url);
+        const extracted = extractReadableContent(html, finalUrl);
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              title: extracted.title,
-              url: finalUrl,
-              sections: extracted.sections,
-              tables: include_tables ? extractTables(html) : [],
-              links: include_links ? extracted.links : []
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                title: extracted.title,
+                url: finalUrl,
+                sections: extracted.sections,
+                tables: include_tables ? extractTables(html) : [],
+                links: include_links ? extracted.links : []
+              }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
 
-server.tool(
-  'list_sections',
-  'Lista secciones navegables del sitio.',
-  {
-    root_path: z.string().default('/')
-  },
-  async ({ root_path }) => {
-    try {
-      const { html } = await fetchPage(root_path);
-      const $ = cheerio.load(html);
-      const sections = [];
+  server.tool(
+    'list_sections',
+    'Lista secciones navegables del sitio.',
+    {
+      root_path: z.string().default('/')
+    },
+    async ({ root_path }) => {
+      try {
+        const { html } = await fetchPage(root_path);
+        const $ = cheerio.load(html);
+        const sections = [];
 
-      $('a[href]').each((_, el) => {
-        const title = $(el).text().trim();
-        const href = $(el).attr('href');
-        if (!title || !href) return;
-        const url = normalizeUrl(href);
-        if (!urlBelongsToSite(url)) return;
-        sections.push({
-          title,
-          path: new URL(url).pathname,
-          url
+        $('a[href]').each((_, el) => {
+          const title = $(el).text().trim();
+          const href = $(el).attr('href');
+          if (!title || !href) return;
+          const url = normalizeUrl(href);
+          if (!url.startsWith(BASE_URL)) return;
+          sections.push({
+            title,
+            path: new URL(url).pathname,
+            url
+          });
         });
-      });
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ sections: dedupeLinks(sections).slice(0, 100) }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ sections: dedupeLinks(sections).slice(0, 100) }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
+
+  return server;
+}
 
 function mcpError(error) {
   const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
@@ -567,5 +484,105 @@ function mcpError(error) {
   };
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Protocol-Version');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+
+    req.on('end', () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error('INVALID_JSON'));
+      }
+    });
+
+    req.on('error', reject);
+  });
+}
+
+async function startHttpServer() {
+  const port = Number(process.env.PORT || 3000);
+  const httpServer = createHttpServer(async (req, res) => {
+    setCorsHeaders(res);
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204).end();
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        name: 'ia-cae-zurekin-mcp',
+        status: 'ok',
+        endpoint: '/mcp'
+      }));
+      return;
+    }
+
+    if (req.method !== 'POST' || req.url !== '/mcp') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Usa POST /mcp para las peticiones MCP.'
+        }
+      }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: true
+      });
+      const server = createMcpServer();
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+      if (!res.headersSent) {
+        res.writeHead(message === 'INVALID_JSON' ? 400 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: {
+            code: message,
+            message
+          }
+        }));
+      }
+    }
+  });
+
+  httpServer.listen(port, '0.0.0.0', () => {
+    console.log(`IA CAE Zurekin MCP escuchando en HTTP en el puerto ${port}`);
+  });
+}
+
+async function start() {
+  if (process.env.PORT) {
+    await startHttpServer();
+    return;
+  }
+
+  const server = createMcpServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+await start();
