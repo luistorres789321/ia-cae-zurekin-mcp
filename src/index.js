@@ -1,10 +1,13 @@
 import 'dotenv/config';
+import express from 'express';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import { CookieJar } from 'tough-cookie';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+
+const PORT = Number(process.env.PORT || 3000);
 
 const BASE_URL = process.env.CAEZ_BASE_URL;
 const USERNAME = process.env.CAEZ_USERNAME;
@@ -51,6 +54,7 @@ async function storeSetCookie(url, response) {
 async function request(url, options = {}) {
   const finalUrl = normalizeUrl(url);
   const cookieHeader = await getCookieHeader(finalUrl);
+
   const headers = {
     ...(options.headers || {}),
     ...(cookieHeader ? { cookie: cookieHeader } : {})
@@ -68,6 +72,7 @@ async function request(url, options = {}) {
 
 async function ensureAuthenticated() {
   if (authenticated) return;
+
   if (!USERNAME || !PASSWORD) {
     throw new Error('AUTH_FAILED: faltan credenciales en variables de entorno');
   }
@@ -115,7 +120,11 @@ function extractReadableContent(html, pageUrl) {
   const $ = cheerio.load(html);
   $('script, style, noscript').remove();
 
-  const title = $('title').first().text().trim() || $('h1').first().text().trim() || pageUrl;
+  const title =
+    $('title').first().text().trim() ||
+    $('h1').first().text().trim() ||
+    pageUrl;
+
   const sections = [];
 
   $('h1, h2, h3').each((_, el) => {
@@ -139,12 +148,14 @@ function extractReadableContent(html, pageUrl) {
     const href = $(el).attr('href');
     const label = $(el).text().trim();
     if (!href) return;
+
     try {
       const url = new URL(href, pageUrl).toString();
       if (url.startsWith(BASE_URL)) {
         links.push({ label: label || url, url });
       }
     } catch {
+      // ignore invalid hrefs
     }
   });
 
@@ -198,175 +209,15 @@ function extractTables(html) {
 async function fetchPage(urlOrPath) {
   await ensureAuthenticated();
   const response = await request(urlOrPath, { method: 'GET' });
+
   if (!response.ok) {
     throw new Error(response.status === 404 ? 'PAGE_NOT_FOUND' : 'INTERNAL_ERROR');
   }
+
   const finalUrl = response.url || normalizeUrl(urlOrPath);
   const html = await response.text();
   return { html, finalUrl };
 }
-
-const server = new McpServer({
-  name: 'ia-cae-zurekin-mcp',
-  version: '1.0.0'
-});
-
-server.tool(
-  'search_pages',
-  'Busca contenido dentro de la web interna autenticada.',
-  {
-    query: z.string(),
-    limit: z.number().int().min(1).max(20).default(10),
-    section: z.string().optional()
-  },
-  async ({ query, limit, section }) => {
-    try {
-      const searchUrl = SEARCH_PATH
-        ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
-        : section || '/';
-
-      const { html, finalUrl } = await fetchPage(searchUrl);
-      const $ = cheerio.load(html);
-      const results = [];
-
-      $('a[href]').each((_, el) => {
-        if (results.length >= limit) return false;
-        const title = $(el).text().trim();
-        const href = $(el).attr('href');
-        if (!title || !href) return;
-        const snippet = $(el).parent().text().trim().slice(0, 240);
-        const url = normalizeUrl(href);
-        if (!url.startsWith(BASE_URL)) return;
-        if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
-        results.push({
-          title,
-          url,
-          path: new URL(url).pathname,
-          snippet,
-          score: 0.5
-        });
-      });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ results, total: results.length, searched_from: finalUrl }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
-    }
-  }
-);
-
-server.tool(
-  'get_page',
-  'Obtiene una página concreta del sitio.',
-  {
-    url: z.string().optional(),
-    path: z.string().optional()
-  },
-  async ({ url, path }) => {
-    try {
-      if (!url && !path) throw new Error('INVALID_URL');
-      const target = url || path;
-      const { html, finalUrl } = await fetchPage(target);
-      const extracted = extractReadableContent(html, finalUrl);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              title: extracted.title,
-              url: finalUrl,
-              path: new URL(finalUrl).pathname,
-              content_text: extracted.contentText,
-              content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
-              links: extracted.links
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
-    }
-  }
-);
-
-server.tool(
-  'extract_page_content',
-  'Extrae el contenido estructurado de una página.',
-  {
-    url: z.string(),
-    include_tables: z.boolean().default(true),
-    include_links: z.boolean().default(true)
-  },
-  async ({ url, include_tables, include_links }) => {
-    try {
-      const { html, finalUrl } = await fetchPage(url);
-      const extracted = extractReadableContent(html, finalUrl);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              title: extracted.title,
-              url: finalUrl,
-              sections: extracted.sections,
-              tables: include_tables ? extractTables(html) : [],
-              links: include_links ? extracted.links : []
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
-    }
-  }
-);
-
-server.tool(
-  'list_sections',
-  'Lista secciones navegables del sitio.',
-  {
-    root_path: z.string().default('/')
-  },
-  async ({ root_path }) => {
-    try {
-      const { html } = await fetchPage(root_path);
-      const $ = cheerio.load(html);
-      const sections = [];
-
-      $('a[href]').each((_, el) => {
-        const title = $(el).text().trim();
-        const href = $(el).attr('href');
-        if (!title || !href) return;
-        const url = normalizeUrl(href);
-        if (!url.startsWith(BASE_URL)) return;
-        sections.push({
-          title,
-          path: new URL(url).pathname,
-          url
-        });
-      });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ sections: dedupeLinks(sections).slice(0, 100) }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
-    }
-  }
-);
 
 function mcpError(error) {
   const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
@@ -374,17 +225,275 @@ function mcpError(error) {
     content: [
       {
         type: 'text',
-        text: JSON.stringify({
-          error: {
-            code: message.split(':')[0],
-            message
-          }
-        }, null, 2)
+        text: JSON.stringify(
+          {
+            error: {
+              code: message.split(':')[0],
+              message
+            }
+          },
+          null,
+          2
+        )
       }
     ],
     isError: true
   };
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+function buildServer() {
+  const server = new McpServer({
+    name: 'ia-cae-zurekin-mcp',
+    version: '1.0.0'
+  });
+
+  server.tool(
+    'search_pages',
+    'Busca contenido dentro de la web interna autenticada.',
+    {
+      query: z.string(),
+      limit: z.number().int().min(1).max(20).default(10),
+      section: z.string().optional()
+    },
+    async ({ query, limit, section }) => {
+      try {
+        const searchUrl = SEARCH_PATH
+          ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
+          : section || '/';
+
+        const { html, finalUrl } = await fetchPage(searchUrl);
+        const $ = cheerio.load(html);
+        const results = [];
+
+        $('a[href]').each((_, el) => {
+          if (results.length >= limit) return false;
+
+          const title = $(el).text().trim();
+          const href = $(el).attr('href');
+          if (!title || !href) return;
+
+          const snippet = $(el).parent().text().trim().slice(0, 240);
+          const url = normalizeUrl(href);
+
+          if (!url.startsWith(BASE_URL)) return;
+          if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
+
+          results.push({
+            title,
+            url,
+            path: new URL(url).pathname,
+            snippet,
+            score: 0.5
+          });
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                { results, total: results.length, searched_from: finalUrl },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'get_page',
+    'Obtiene una página concreta del sitio.',
+    {
+      url: z.string().optional(),
+      path: z.string().optional()
+    },
+    async ({ url, path }) => {
+      try {
+        if (!url && !path) throw new Error('INVALID_URL');
+        const target = url || path;
+        const { html, finalUrl } = await fetchPage(target);
+        const extracted = extractReadableContent(html, finalUrl);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  title: extracted.title,
+                  url: finalUrl,
+                  path: new URL(finalUrl).pathname,
+                  content_text: extracted.contentText,
+                  content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
+                  links: extracted.links
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'extract_page_content',
+    'Extrae el contenido estructurado de una página.',
+    {
+      url: z.string(),
+      include_tables: z.boolean().default(true),
+      include_links: z.boolean().default(true)
+    },
+    async ({ url, include_tables, include_links }) => {
+      try {
+        const { html, finalUrl } = await fetchPage(url);
+        const extracted = extractReadableContent(html, finalUrl);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  title: extracted.title,
+                  url: finalUrl,
+                  sections: extracted.sections,
+                  tables: include_tables ? extractTables(html) : [],
+                  links: include_links ? extracted.links : []
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
+    }
+  );
+
+  server.tool(
+    'list_sections',
+    'Lista secciones navegables del sitio.',
+    {
+      root_path: z.string().default('/')
+    },
+    async ({ root_path }) => {
+      try {
+        const { html } = await fetchPage(root_path);
+        const $ = cheerio.load(html);
+        const sections = [];
+
+        $('a[href]').each((_, el) => {
+          const title = $(el).text().trim();
+          const href = $(el).attr('href');
+          if (!title || !href) return;
+
+          const url = normalizeUrl(href);
+          if (!url.startsWith(BASE_URL)) return;
+
+          sections.push({
+            title,
+            path: new URL(url).pathname,
+            url
+          });
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                { sections: dedupeLinks(sections).slice(0, 100) },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
+    }
+  );
+
+  return server;
+}
+
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+const transports = new Map();
+
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'ia-cae-zurekin-mcp',
+    transport: 'sse',
+    endpoints: {
+      health: '/health',
+      sse: '/sse',
+      messages: '/messages?sessionId=...'
+    }
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+app.get('/sse', async (_req, res) => {
+  try {
+    const server = buildServer();
+    const transport = new SSEServerTransport('/messages', res);
+
+    transports.set(transport.sessionId, transport);
+
+    res.on('close', () => {
+      transports.delete(transport.sessionId);
+    });
+
+    await server.connect(transport);
+  } catch (error) {
+    console.error('SSE connection error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to establish SSE connection' });
+    }
+  }
+});
+
+app.post('/messages', async (req, res) => {
+  const sessionId = req.query.sessionId;
+
+  if (!sessionId || typeof sessionId !== 'string') {
+    return res.status(400).json({ error: 'Missing sessionId' });
+  }
+
+  const transport = transports.get(sessionId);
+
+  if (!transport) {
+    return res.status(404).json({ error: 'Unknown sessionId' });
+  }
+
+  try {
+    await transport.handlePostMessage(req, res, req.body);
+  } catch (error) {
+    console.error('POST /messages error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to handle MCP message' });
+    }
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`IA CAE Zurekin MCP listening on port ${PORT}`);
+});
