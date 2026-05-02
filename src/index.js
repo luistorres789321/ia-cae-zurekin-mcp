@@ -1,9 +1,12 @@
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import { CookieJar } from 'tough-cookie';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 const BASE_URL = process.env.CAEZ_BASE_URL;
@@ -297,167 +300,171 @@ async function fetchPage(urlOrPath) {
   return { html, finalUrl };
 }
 
-const server = new McpServer({
-  name: 'ia-cae-zurekin-mcp',
-  version: '1.0.0'
-});
+function createMcpServer() {
+  const server = new McpServer({
+    name: 'ia-cae-zurekin-mcp',
+    version: '1.0.0'
+  });
 
-server.tool(
-  'search_pages',
-  'Busca contenido dentro de la web interna autenticada.',
-  {
-    query: z.string(),
-    limit: z.number().int().min(1).max(20).default(10),
-    section: z.string().optional()
-  },
-  async ({ query, limit, section }) => {
-    try {
-      const searchUrl = SEARCH_PATH
-        ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
-        : section || '/';
+  server.tool(
+    'search_pages',
+    'Busca contenido dentro de la web interna autenticada.',
+    {
+      query: z.string(),
+      limit: z.number().int().min(1).max(20).default(10),
+      section: z.string().optional()
+    },
+    async ({ query, limit, section }) => {
+      try {
+        const searchUrl = SEARCH_PATH
+          ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
+          : section || '/';
 
-      const { html, finalUrl } = await fetchPage(searchUrl);
-      const $ = cheerio.load(html);
-      const results = [];
+        const { html, finalUrl } = await fetchPage(searchUrl);
+        const $ = cheerio.load(html);
+        const results = [];
 
-      $('a[href]').each((_, el) => {
-        if (results.length >= limit) return false;
-        const title = $(el).text().trim();
-        const href = $(el).attr('href');
-        if (!title || !href) return;
-        const snippet = $(el).parent().text().trim().slice(0, 240);
-        const url = normalizeUrl(href);
-        if (!url.startsWith(BASE_URL)) return;
-        if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
-        results.push({
-          title,
-          url,
-          path: new URL(url).pathname,
-          snippet,
-          score: 0.5
+        $('a[href]').each((_, el) => {
+          if (results.length >= limit) return false;
+          const title = $(el).text().trim();
+          const href = $(el).attr('href');
+          if (!title || !href) return;
+          const snippet = $(el).parent().text().trim().slice(0, 240);
+          const url = normalizeUrl(href);
+          if (!url.startsWith(BASE_URL)) return;
+          if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
+          results.push({
+            title,
+            url,
+            path: new URL(url).pathname,
+            snippet,
+            score: 0.5
+          });
         });
-      });
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ results, total: results.length, searched_from: finalUrl }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ results, total: results.length, searched_from: finalUrl }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
 
-server.tool(
-  'get_page',
-  'Obtiene una página concreta del sitio.',
-  {
-    url: z.string().optional(),
-    path: z.string().optional()
-  },
-  async ({ url, path }) => {
-    try {
-      if (!url && !path) throw new Error('INVALID_URL');
-      const target = url || path;
-      const { html, finalUrl } = await fetchPage(target);
-      const extracted = extractReadableContent(html, finalUrl);
+  server.tool(
+    'get_page',
+    'Obtiene una página concreta del sitio.',
+    {
+      url: z.string().optional(),
+      path: z.string().optional()
+    },
+    async ({ url, path }) => {
+      try {
+        if (!url && !path) throw new Error('INVALID_URL');
+        const target = url || path;
+        const { html, finalUrl } = await fetchPage(target);
+        const extracted = extractReadableContent(html, finalUrl);
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              title: extracted.title,
-              url: finalUrl,
-              path: new URL(finalUrl).pathname,
-              content_text: extracted.contentText,
-              content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
-              links: extracted.links
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                title: extracted.title,
+                url: finalUrl,
+                path: new URL(finalUrl).pathname,
+                content_text: extracted.contentText,
+                content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
+                links: extracted.links
+              }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
 
-server.tool(
-  'extract_page_content',
-  'Extrae el contenido estructurado de una página.',
-  {
-    url: z.string(),
-    include_tables: z.boolean().default(true),
-    include_links: z.boolean().default(true)
-  },
-  async ({ url, include_tables, include_links }) => {
-    try {
-      const { html, finalUrl } = await fetchPage(url);
-      const extracted = extractReadableContent(html, finalUrl);
+  server.tool(
+    'extract_page_content',
+    'Extrae el contenido estructurado de una página.',
+    {
+      url: z.string(),
+      include_tables: z.boolean().default(true),
+      include_links: z.boolean().default(true)
+    },
+    async ({ url, include_tables, include_links }) => {
+      try {
+        const { html, finalUrl } = await fetchPage(url);
+        const extracted = extractReadableContent(html, finalUrl);
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              title: extracted.title,
-              url: finalUrl,
-              sections: extracted.sections,
-              tables: include_tables ? extractTables(html) : [],
-              links: include_links ? extracted.links : []
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                title: extracted.title,
+                url: finalUrl,
+                sections: extracted.sections,
+                tables: include_tables ? extractTables(html) : [],
+                links: include_links ? extracted.links : []
+              }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
 
-server.tool(
-  'list_sections',
-  'Lista secciones navegables del sitio.',
-  {
-    root_path: z.string().default('/')
-  },
-  async ({ root_path }) => {
-    try {
-      const { html } = await fetchPage(root_path);
-      const $ = cheerio.load(html);
-      const sections = [];
+  server.tool(
+    'list_sections',
+    'Lista secciones navegables del sitio.',
+    {
+      root_path: z.string().default('/')
+    },
+    async ({ root_path }) => {
+      try {
+        const { html } = await fetchPage(root_path);
+        const $ = cheerio.load(html);
+        const sections = [];
 
-      $('a[href]').each((_, el) => {
-        const title = $(el).text().trim();
-        const href = $(el).attr('href');
-        if (!title || !href) return;
-        const url = normalizeUrl(href);
-        if (!url.startsWith(BASE_URL)) return;
-        sections.push({
-          title,
-          path: new URL(url).pathname,
-          url
+        $('a[href]').each((_, el) => {
+          const title = $(el).text().trim();
+          const href = $(el).attr('href');
+          if (!title || !href) return;
+          const url = normalizeUrl(href);
+          if (!url.startsWith(BASE_URL)) return;
+          sections.push({
+            title,
+            path: new URL(url).pathname,
+            url
+          });
         });
-      });
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ sections: dedupeLinks(sections).slice(0, 100) }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      return mcpError(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ sections: dedupeLinks(sections).slice(0, 100) }, null, 2)
+            }
+          ]
+        };
+      } catch (error) {
+        return mcpError(error);
+      }
     }
-  }
-);
+  );
+
+  return server;
+}
 
 function mcpError(error) {
   const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
@@ -477,5 +484,105 @@ function mcpError(error) {
   };
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Mcp-Protocol-Version');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+
+    req.on('end', () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error('INVALID_JSON'));
+      }
+    });
+
+    req.on('error', reject);
+  });
+}
+
+async function startHttpServer() {
+  const port = Number(process.env.PORT || 3000);
+  const httpServer = createHttpServer(async (req, res) => {
+    setCorsHeaders(res);
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204).end();
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        name: 'ia-cae-zurekin-mcp',
+        status: 'ok',
+        endpoint: '/mcp'
+      }));
+      return;
+    }
+
+    if (req.method !== 'POST' || req.url !== '/mcp') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Usa POST /mcp para las peticiones MCP.'
+        }
+      }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: true
+      });
+      const server = createMcpServer();
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+      if (!res.headersSent) {
+        res.writeHead(message === 'INVALID_JSON' ? 400 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: {
+            code: message,
+            message
+          }
+        }));
+      }
+    }
+  });
+
+  httpServer.listen(port, '0.0.0.0', () => {
+    console.log(`IA CAE Zurekin MCP escuchando en HTTP en el puerto ${port}`);
+  });
+}
+
+async function start() {
+  if (process.env.PORT) {
+    await startHttpServer();
+    return;
+  }
+
+  const server = createMcpServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+await start();
