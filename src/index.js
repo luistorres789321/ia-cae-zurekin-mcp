@@ -19,6 +19,12 @@ const DSN = process.env.CAEZ_DSN || 'CAE';
 const LOGIN_USER_FIELD = process.env.CAEZ_LOGIN_USER_FIELD || 'username';
 const LOGIN_PASSWORD_FIELD = process.env.CAEZ_LOGIN_PASSWORD_FIELD || 'password';
 const LOGIN_EXTRA_FIELDS = safeParseJson(process.env.CAEZ_LOGIN_EXTRA_FIELDS, {});
+const LOGIN_METHOD = (process.env.CAEZ_LOGIN_METHOD || 'AUTO').toUpperCase();
+const LOGIN_FORM_SELECTOR = process.env.CAEZ_LOGIN_FORM_SELECTOR || 'form';
+const LOGIN_ACTIONS = (process.env.CAEZ_LOGIN_ACTIONS || 'comprueba_usuario_password,obtener_itinerarios_externos')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
 const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '';
 const PORT = Number(process.env.PORT || 3000);
 const MCP_PATH = process.env.MCP_PATH || '/mcp';
@@ -36,6 +42,13 @@ const TRUSTED_ORIGINS = Array.from(new Set(
 const cookieJar = new CookieJar();
 let authenticated = false;
 const transports = new Map();
+
+function createDetailedError(code, message, details = {}) {
+  const error = new Error(`${code}: ${message}`);
+  error.code = code;
+  error.details = details;
+  return error;
+}
 
 function safeParseJson(value, fallback) {
   if (!value) return fallback;
@@ -111,6 +124,38 @@ async function request(url, options = {}) {
   return response;
 }
 
+function summarizeText(text, maxLength = 320) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+async function readResponseText(response) {
+  try {
+    return await response.text();
+  } catch {
+    return '';
+  }
+}
+
+async function ensureOkResponse(response, context) {
+  if (response.ok) return response;
+
+  const body = await readResponseText(response);
+  const code = response.status === 500 ? 'AUTH_HTTP_500' : 'AUTH_HTTP_ERROR';
+  throw createDetailedError(
+    code,
+    `${context} devolvió ${response.status}`,
+    {
+      status: response.status,
+      url: response.url || null,
+      context,
+      body_excerpt: summarizeText(body)
+    }
+  );
+}
+
 function looksLikeLoginPage(html, pageUrl = '') {
   const $ = cheerio.load(html);
   const text = $('body').text().toLowerCase();
@@ -145,11 +190,19 @@ function looksLikeAccessDenied(html) {
 
 function assertAccessiblePage(html, pageUrl) {
   if (looksLikeLoginPage(html, pageUrl)) {
-    throw new Error(`AUTH_FAILED: el sitio sigue mostrando la pantalla de login (${pageUrl})`);
+    throw createDetailedError(
+      'AUTH_FAILED',
+      `el sitio sigue mostrando la pantalla de login (${pageUrl})`,
+      { page_url: pageUrl }
+    );
   }
 
   if (looksLikeAccessDenied(html)) {
-    throw new Error(`AUTH_FAILED: el sitio devolvió una pantalla de acceso denegado (${pageUrl})`);
+    throw createDetailedError(
+      'AUTH_FAILED',
+      `el sitio devolvió una pantalla de acceso denegado (${pageUrl})`,
+      { page_url: pageUrl }
+    );
   }
 }
 
@@ -167,17 +220,96 @@ function buildLoginActionUrl(action) {
 
 async function runLoginAction(action) {
   const response = await request(buildLoginActionUrl(action), { method: 'GET' });
-  if (!response.ok) {
-    throw new Error(`AUTH_FAILED: la llamada de login ${action} devolvió ${response.status}`);
+  await ensureOkResponse(response, `la llamada de login ${action}`);
+  return readResponseText(response);
+}
+
+function extractLoginForm(html, pageUrl) {
+  const $ = cheerio.load(html);
+  let form = $(LOGIN_FORM_SELECTOR).first();
+
+  if (!form.length) {
+    form = $('form').filter((_, el) => $(el).find('input[type="password"]').length > 0).first();
   }
-  return response.text();
+
+  if (!form.length) return null;
+
+  const method = (form.attr('method') || 'POST').toUpperCase();
+  const action = form.attr('action') || pageUrl;
+  const hiddenFields = {};
+
+  form.find('input').each((_, el) => {
+    const input = $(el);
+    const name = input.attr('name');
+    if (!name) return;
+    const type = (input.attr('type') || 'text').toLowerCase();
+    if (['submit', 'button', 'image', 'file'].includes(type)) return;
+    hiddenFields[name] = input.val() ?? '';
+  });
+
+  return {
+    method,
+    action,
+    hiddenFields
+  };
+}
+
+async function fetchLoginPage() {
+  const response = await request(LOGIN_URL, { method: 'GET' });
+  await ensureOkResponse(response, 'la carga inicial de la página de login');
+  const html = await readResponseText(response);
+  return {
+    html,
+    finalUrl: response.url || normalizeUrl(LOGIN_URL)
+  };
+}
+
+async function submitLoginForm(loginPage) {
+  const form = extractLoginForm(loginPage.html, loginPage.finalUrl);
+  if (!form) {
+    throw createDetailedError(
+      'AUTH_FORM_NOT_FOUND',
+      'no se encontró un formulario de login en la página inicial',
+      { page_url: loginPage.finalUrl }
+    );
+  }
+
+  const actionUrl = normalizeUrl(form.action);
+  const method = LOGIN_METHOD === 'AUTO' ? form.method : LOGIN_METHOD;
+  const payload = {
+    ...form.hiddenFields,
+    ...LOGIN_EXTRA_FIELDS,
+    [LOGIN_USER_FIELD]: USERNAME,
+    [LOGIN_PASSWORD_FIELD]: PASSWORD
+  };
+
+  let response;
+
+  if (method === 'GET') {
+    const params = new URLSearchParams(
+      Object.entries(payload).map(([key, value]) => [key, String(value ?? '')])
+    );
+    const separator = actionUrl.includes('?') ? '&' : '?';
+    response = await request(`${actionUrl}${separator}${params.toString()}`, { method: 'GET' });
+  } else {
+    response = await request(actionUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams(
+        Object.entries(payload).map(([key, value]) => [key, String(value ?? '')])
+      ).toString()
+    });
+  }
+
+  await ensureOkResponse(response, `el envío del formulario de login por ${method}`);
+  return readResponseText(response);
 }
 
 async function verifyAuthenticatedBasePage() {
   const baseResponse = await request(BASE_URL, { method: 'GET' });
-  if (!baseResponse.ok) {
-    throw new Error(`AUTH_FAILED: la página base devolvió ${baseResponse.status}`);
-  }
+  await ensureOkResponse(baseResponse, 'la página base tras autenticar');
 
   const baseUrl = baseResponse.url || normalizeUrl(BASE_URL);
   const baseHtml = await baseResponse.text();
@@ -188,27 +320,103 @@ async function verifyAuthenticatedBasePage() {
 async function ensureAuthenticated() {
   if (authenticated) return;
   if (!USERNAME || !PASSWORD) {
-    throw new Error('AUTH_FAILED: faltan credenciales en variables de entorno');
+    throw createDetailedError(
+      'AUTH_FAILED',
+      'faltan credenciales en variables de entorno',
+      { username_present: Boolean(USERNAME), password_present: Boolean(PASSWORD) }
+    );
   }
 
-  await request(LOGIN_URL, { method: 'GET' });
-  await runLoginAction('comprueba_usuario_password');
+  const attemptLog = [];
+  const loginPage = await fetchLoginPage();
+  attemptLog.push({
+    step: 'fetch_login_page',
+    url: loginPage.finalUrl,
+    login_page_detected: looksLikeLoginPage(loginPage.html, loginPage.finalUrl)
+  });
 
   try {
     await verifyAuthenticatedBasePage();
     authenticated = true;
     return;
-  } catch (primaryError) {
-    await runLoginAction('obtener_itinerarios_externos');
+  } catch {
+    // Continúa con estrategias activas de autenticación.
+  }
 
+  const canTryActions = LOGIN_METHOD === 'AUTO' || LOGIN_METHOD === 'GET_ACTION';
+  if (canTryActions) {
+    for (const action of LOGIN_ACTIONS) {
+      try {
+        await runLoginAction(action);
+        attemptLog.push({ step: 'login_action', action, result: 'ok' });
+        await verifyAuthenticatedBasePage();
+        authenticated = true;
+        return;
+      } catch (error) {
+        attemptLog.push({
+          step: 'login_action',
+          action,
+          result: 'error',
+          error: error instanceof Error ? error.message : 'INTERNAL_ERROR'
+        });
+        if (error?.code === 'AUTH_HTTP_500') {
+          throw createDetailedError(
+            'AUTH_HTTP_500',
+            `el login del sitio interno devolvió 500 durante la acción ${action}`,
+            {
+              login_url: LOGIN_URL,
+              login_endpoint: LOGIN_ENDPOINT,
+              action,
+              attempts: attemptLog,
+              upstream: error.details || null
+            }
+          );
+        }
+      }
+    }
+  }
+
+  const canTryForm = LOGIN_METHOD === 'AUTO' || LOGIN_METHOD === 'FORM' || LOGIN_METHOD === 'POST';
+  if (canTryForm) {
     try {
+      await submitLoginForm(loginPage);
+      attemptLog.push({ step: 'submit_login_form', result: 'ok', method: LOGIN_METHOD });
       await verifyAuthenticatedBasePage();
       authenticated = true;
       return;
-    } catch {
-      throw primaryError;
+    } catch (error) {
+      attemptLog.push({
+        step: 'submit_login_form',
+        result: 'error',
+        method: LOGIN_METHOD,
+        error: error instanceof Error ? error.message : 'INTERNAL_ERROR'
+      });
+
+      if (error?.code === 'AUTH_HTTP_500') {
+        throw createDetailedError(
+          'AUTH_HTTP_500',
+          'el login del sitio interno devolvió 500 al enviar el formulario',
+          {
+            login_url: LOGIN_URL,
+            login_field_user: LOGIN_USER_FIELD,
+            login_field_password: LOGIN_PASSWORD_FIELD,
+            attempts: attemptLog,
+            upstream: error.details || null
+          }
+        );
+      }
     }
   }
+
+  throw createDetailedError(
+    'AUTH_FAILED',
+    'no se pudo completar la autenticación contra el sitio interno',
+    {
+      login_url: LOGIN_URL,
+      login_method: LOGIN_METHOD,
+      attempts: attemptLog
+    }
+  );
 }
 
 function extractReadableContent(html, pageUrl) {
@@ -305,14 +513,16 @@ async function fetchPage(urlOrPath) {
 
 function mcpError(error) {
   const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+  const code = error?.code || message.split(':')[0];
   return {
     content: [
       {
         type: 'text',
         text: JSON.stringify({
           error: {
-            code: message.split(':')[0],
-            message
+            code,
+            message,
+            details: error?.details || null
           }
         }, null, 2)
       }
