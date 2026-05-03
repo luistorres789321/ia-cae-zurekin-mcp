@@ -15,6 +15,7 @@
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "node-fetch": "^3.3.2",
+    "playwright": "^1.56.1",
     "tough-cookie": "^5.0.0",
     "zod": "^3.23.8"
   }
