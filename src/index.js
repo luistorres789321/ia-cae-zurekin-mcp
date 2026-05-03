@@ -2,30 +2,28 @@ import 'dotenv/config';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import express from 'express';
-import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
-import { CookieJar } from 'tough-cookie';
+import { chromium } from 'playwright';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
 const BASE_URL = process.env.CAEZ_BASE_URL;
+const LOGIN_URL = process.env.CAEZ_LOGIN_URL || BASE_URL;
 const USERNAME = process.env.CAEZ_USERNAME;
 const PASSWORD = process.env.CAEZ_PASSWORD;
-const LOGIN_URL = process.env.CAEZ_LOGIN_URL || BASE_URL;
-const LOGIN_ENDPOINT = process.env.CAEZ_LOGIN_ENDPOINT || '/datos_servidor_CAE_ZUREKIN/inicio.aspx';
-const DSN = process.env.CAEZ_DSN || 'CAE';
-const LOGIN_USER_FIELD = process.env.CAEZ_LOGIN_USER_FIELD || 'username';
-const LOGIN_PASSWORD_FIELD = process.env.CAEZ_LOGIN_PASSWORD_FIELD || 'password';
-const LOGIN_EXTRA_FIELDS = safeParseJson(process.env.CAEZ_LOGIN_EXTRA_FIELDS, {});
-const LOGIN_METHOD = (process.env.CAEZ_LOGIN_METHOD || 'AUTO').toUpperCase();
-const LOGIN_FORM_SELECTOR = process.env.CAEZ_LOGIN_FORM_SELECTOR || 'form';
-const LOGIN_ACTIONS = (process.env.CAEZ_LOGIN_ACTIONS || 'comprueba_usuario_password,obtener_itinerarios_externos')
-  .split(',')
-  .map((item) => item.trim())
-  .filter(Boolean);
-const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '';
+
+const USERNAME_SELECTOR = process.env.CAEZ_USERNAME_SELECTOR || '#caez-usuario';
+const PASSWORD_SELECTOR = process.env.CAEZ_PASSWORD_SELECTOR || '#caez-password';
+const SUBMIT_SELECTOR = process.env.CAEZ_SUBMIT_SELECTOR || '#caez-login-submit';
+
+const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '/inicio/itinerarios';
+const SEARCH_APPEND_QUERY = process.env.CAEZ_SEARCH_APPEND_QUERY === 'true';
+const LOGIN_SUCCESS_URL = process.env.CAEZ_LOGIN_SUCCESS_URL || '**/inicio/itinerarios**';
+const HEADLESS = process.env.CAEZ_HEADLESS !== 'false';
+const TIMEOUT_MS = Number(process.env.CAEZ_TIMEOUT_MS || 30000);
+
 const PORT = Number(process.env.PORT || 3000);
 const MCP_PATH = process.env.MCP_PATH || '/mcp';
 
@@ -34,12 +32,11 @@ if (!BASE_URL) {
 }
 
 const TRUSTED_ORIGINS = Array.from(new Set(
-  [BASE_URL, LOGIN_URL]
-    .filter(Boolean)
-    .map((url) => new URL(url).origin)
+  [BASE_URL, LOGIN_URL].filter(Boolean).map((url) => new URL(url).origin)
 ));
 
-const cookieJar = new CookieJar();
+let browser = null;
+let browserContext = null;
 let authenticated = false;
 const transports = new Map();
 
@@ -50,118 +47,104 @@ function createDetailedError(code, message, details = {}) {
   return error;
 }
 
-function safeParseJson(value, fallback) {
-  if (!value) return fallback;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
+function summarizeText(text, maxLength = 500) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
-function normalizeUrl(input) {
-  try {
-    return new URL(input, BASE_URL).toString();
-  } catch {
-    throw new Error('INVALID_URL');
-  }
+function trimTrailingSlash(value) {
+  return String(value || '').replace(/\/+$/, '');
 }
 
-function getPathname(input) {
-  try {
-    return new URL(input, BASE_URL).pathname.toLowerCase();
-  } catch {
-    return '';
+function normalizeUrl(input = '') {
+  const base = new URL(BASE_URL);
+
+  if (!input) return BASE_URL;
+
+  if (/^https?:\/\//i.test(input)) {
+    return new URL(input).toString();
   }
-}
 
-function isLikelyLoginUrl(url) {
-  const pathname = getPathname(url);
-  const loginPathname = getPathname(LOGIN_URL);
-  const loginEndpointPathname = getPathname(LOGIN_ENDPOINT);
+  if (input.startsWith('/')) {
+    const basePath = trimTrailingSlash(base.pathname);
+    return `${base.origin}${basePath}${input}`;
+  }
 
-  return pathname === loginPathname
-    || pathname === loginEndpointPathname
-    || pathname.includes('login')
-    || pathname.includes('signin')
-    || pathname.includes('auth');
+  const baseWithSlash = BASE_URL.endsWith('/') ? BASE_URL : `${BASE_URL}/`;
+  return new URL(input, baseWithSlash).toString();
 }
 
 function assertTrustedOrigin(url) {
   const origin = new URL(url).origin;
   if (!TRUSTED_ORIGINS.includes(origin)) {
-    throw new Error(
-      `UNEXPECTED_ORIGIN: el servidor respondió desde ${origin}, pero este conector solo acepta ${TRUSTED_ORIGINS.join(', ')}`
+    throw createDetailedError(
+      'UNEXPECTED_ORIGIN',
+      `respuesta desde origen no permitido: ${origin}`,
+      { origin, trusted_origins: TRUSTED_ORIGINS }
     );
   }
 }
 
-async function getCookieHeader(url) {
-  return cookieJar.getCookieString(url);
+async function getBrowserContext() {
+  if (!browser) {
+    browser = await chromium.launch({ headless: HEADLESS });
+  }
+
+  if (!browserContext) {
+    browserContext = await browser.newContext({
+      ignoreHTTPSErrors: true,
+      viewport: { width: 1365, height: 900 }
+    });
+  }
+
+  return browserContext;
 }
 
-async function storeSetCookie(url, response) {
-  const raw = response.headers.raw()['set-cookie'] || [];
-  await Promise.all(raw.map((cookie) => cookieJar.setCookie(cookie, url)));
+async function newPage() {
+  const context = await getBrowserContext();
+  const page = await context.newPage();
+  page.setDefaultTimeout(TIMEOUT_MS);
+  return page;
 }
 
-async function request(url, options = {}) {
-  const finalUrl = normalizeUrl(url);
-  const cookieHeader = await getCookieHeader(finalUrl);
-  const headers = {
-    ...(options.headers || {}),
-    ...(cookieHeader ? { cookie: cookieHeader } : {})
-  };
-
-  const response = await fetch(finalUrl, {
-    redirect: 'follow',
-    ...options,
-    headers
+async function safeGoto(page, urlOrPath, contextLabel) {
+  const url = normalizeUrl(urlOrPath);
+  const response = await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: TIMEOUT_MS
   });
 
-  assertTrustedOrigin(response.url || finalUrl);
-  await storeSetCookie(finalUrl, response);
+  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+  assertTrustedOrigin(page.url());
+
+  if (response && !response.ok()) {
+    const body = await response.text().catch(() => '');
+    throw createDetailedError(
+      'PAGE_HTTP_ERROR',
+      `${contextLabel} devolvió ${response.status()}`,
+      {
+        status: response.status(),
+        url: page.url(),
+        body_excerpt: summarizeText(body)
+      }
+    );
+  }
+
   return response;
 }
 
-function summarizeText(text, maxLength = 320) {
-  return String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, maxLength);
-}
-
-async function readResponseText(response) {
-  try {
-    return await response.text();
-  } catch {
-    return '';
-  }
-}
-
-async function ensureOkResponse(response, context) {
-  if (response.ok) return response;
-
-  const body = await readResponseText(response);
-  const code = response.status === 500 ? 'AUTH_HTTP_500' : 'AUTH_HTTP_ERROR';
-  throw createDetailedError(
-    code,
-    `${context} devolvió ${response.status}`,
-    {
-      status: response.status,
-      url: response.url || null,
-      context,
-      body_excerpt: summarizeText(body)
-    }
-  );
-}
-
-function looksLikeLoginPage(html, pageUrl = '') {
+function looksLikeLoginPage(html) {
   const $ = cheerio.load(html);
-  const text = $('body').text().toLowerCase();
+  const bodyText = $('body').text().toLowerCase();
+
+  const hasConfiguredUser = USERNAME_SELECTOR.startsWith('#')
+    ? $(USERNAME_SELECTOR).length > 0
+    : false;
+
+  const hasConfiguredPassword = PASSWORD_SELECTOR.startsWith('#')
+    ? $(PASSWORD_SELECTOR).length > 0
+    : false;
+
   const hasPasswordInput = $('input[type="password"]').length > 0;
-  const hasUserInput = $(`input[name="${LOGIN_USER_FIELD}"]`).length > 0
-    || $('input[name*="user" i], input[name*="email" i]').length > 0;
   const loginTextDetected = [
     'login',
     'log in',
@@ -171,13 +154,14 @@ function looksLikeLoginPage(html, pageUrl = '') {
     'usuario',
     'contrase',
     'password'
-  ].some((token) => text.includes(token));
+  ].some((token) => bodyText.includes(token));
 
-  return isLikelyLoginUrl(pageUrl) || (hasPasswordInput && (hasUserInput || loginTextDetected));
+  return (hasConfiguredUser && hasConfiguredPassword) || (hasPasswordInput && loginTextDetected);
 }
 
 function looksLikeAccessDenied(html) {
   const text = cheerio.load(html)('body').text().toLowerCase();
+
   return [
     'access denied',
     'forbidden',
@@ -189,7 +173,7 @@ function looksLikeAccessDenied(html) {
 }
 
 function assertAccessiblePage(html, pageUrl) {
-  if (looksLikeLoginPage(html, pageUrl)) {
+  if (looksLikeLoginPage(html)) {
     throw createDetailedError(
       'AUTH_FAILED',
       `el sitio sigue mostrando la pantalla de login (${pageUrl})`,
@@ -206,224 +190,152 @@ function assertAccessiblePage(html, pageUrl) {
   }
 }
 
-function buildLoginActionUrl(action) {
-  const params = new URLSearchParams({
-    accion: action,
-    DSN,
-    usuario: USERNAME,
-    password: PASSWORD,
-    ...Object.fromEntries(Object.entries(LOGIN_EXTRA_FIELDS).map(([key, value]) => [key, String(value)]))
-  });
-
-  return `${LOGIN_ENDPOINT}?${params.toString()}`;
-}
-
-async function runLoginAction(action) {
-  const response = await request(buildLoginActionUrl(action), { method: 'GET' });
-  await ensureOkResponse(response, `la llamada de login ${action}`);
-  return readResponseText(response);
-}
-
-function extractLoginForm(html, pageUrl) {
-  const $ = cheerio.load(html);
-  let form = $(LOGIN_FORM_SELECTOR).first();
-
-  if (!form.length) {
-    form = $('form').filter((_, el) => $(el).find('input[type="password"]').length > 0).first();
-  }
-
-  if (!form.length) return null;
-
-  const method = (form.attr('method') || 'POST').toUpperCase();
-  const action = form.attr('action') || pageUrl;
-  const hiddenFields = {};
-
-  form.find('input').each((_, el) => {
-    const input = $(el);
-    const name = input.attr('name');
-    if (!name) return;
-    const type = (input.attr('type') || 'text').toLowerCase();
-    if (['submit', 'button', 'image', 'file'].includes(type)) return;
-    hiddenFields[name] = input.val() ?? '';
-  });
-
-  return {
-    method,
-    action,
-    hiddenFields
-  };
-}
-
-async function fetchLoginPage() {
-  const response = await request(LOGIN_URL, { method: 'GET' });
-  await ensureOkResponse(response, 'la carga inicial de la página de login');
-  const html = await readResponseText(response);
-  return {
-    html,
-    finalUrl: response.url || normalizeUrl(LOGIN_URL)
-  };
-}
-
-async function submitLoginForm(loginPage) {
-  const form = extractLoginForm(loginPage.html, loginPage.finalUrl);
-  if (!form) {
-    throw createDetailedError(
-      'AUTH_FORM_NOT_FOUND',
-      'no se encontró un formulario de login en la página inicial',
-      { page_url: loginPage.finalUrl }
-    );
-  }
-
-  const actionUrl = normalizeUrl(form.action);
-  const method = LOGIN_METHOD === 'AUTO' ? form.method : LOGIN_METHOD;
-  const payload = {
-    ...form.hiddenFields,
-    ...LOGIN_EXTRA_FIELDS,
-    [LOGIN_USER_FIELD]: USERNAME,
-    [LOGIN_PASSWORD_FIELD]: PASSWORD
-  };
-
-  let response;
-
-  if (method === 'GET') {
-    const params = new URLSearchParams(
-      Object.entries(payload).map(([key, value]) => [key, String(value ?? '')])
-    );
-    const separator = actionUrl.includes('?') ? '&' : '?';
-    response = await request(`${actionUrl}${separator}${params.toString()}`, { method: 'GET' });
-  } else {
-    response = await request(actionUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded'
-      },
-      body: new URLSearchParams(
-        Object.entries(payload).map(([key, value]) => [key, String(value ?? '')])
-      ).toString()
-    });
-  }
-
-  await ensureOkResponse(response, `el envío del formulario de login por ${method}`);
-  return readResponseText(response);
-}
-
-async function verifyAuthenticatedBasePage() {
-  const baseResponse = await request(BASE_URL, { method: 'GET' });
-  await ensureOkResponse(baseResponse, 'la página base tras autenticar');
-
-  const baseUrl = baseResponse.url || normalizeUrl(BASE_URL);
-  const baseHtml = await baseResponse.text();
-  assertAccessiblePage(baseHtml, baseUrl);
-  return { baseUrl, baseHtml };
-}
-
 async function ensureAuthenticated() {
   if (authenticated) return;
+
   if (!USERNAME || !PASSWORD) {
     throw createDetailedError(
       'AUTH_FAILED',
       'faltan credenciales en variables de entorno',
-      { username_present: Boolean(USERNAME), password_present: Boolean(PASSWORD) }
+      {
+        username_present: Boolean(USERNAME),
+        password_present: Boolean(PASSWORD)
+      }
     );
   }
 
-  const attemptLog = [];
-  const loginPage = await fetchLoginPage();
-  attemptLog.push({
-    step: 'fetch_login_page',
-    url: loginPage.finalUrl,
-    login_page_detected: looksLikeLoginPage(loginPage.html, loginPage.finalUrl)
-  });
+  const page = await newPage();
+  const attempts = [];
 
   try {
-    await verifyAuthenticatedBasePage();
-    authenticated = true;
-    return;
-  } catch {
-    // Continúa con estrategias activas de autenticación.
-  }
+    await safeGoto(page, LOGIN_URL, 'la página de login');
 
-  const canTryActions = LOGIN_METHOD === 'AUTO' || LOGIN_METHOD === 'GET_ACTION';
-  if (canTryActions) {
-    for (const action of LOGIN_ACTIONS) {
-      try {
-        await runLoginAction(action);
-        attemptLog.push({ step: 'login_action', action, result: 'ok' });
-        await verifyAuthenticatedBasePage();
-        authenticated = true;
-        return;
-      } catch (error) {
-        attemptLog.push({
-          step: 'login_action',
-          action,
-          result: 'error',
-          error: error instanceof Error ? error.message : 'INTERNAL_ERROR'
-        });
-        if (error?.code === 'AUTH_HTTP_500') {
-          throw createDetailedError(
-            'AUTH_HTTP_500',
-            `el login del sitio interno devolvió 500 durante la acción ${action}`,
-            {
-              login_url: LOGIN_URL,
-              login_endpoint: LOGIN_ENDPOINT,
-              action,
-              attempts: attemptLog,
-              upstream: error.details || null
-            }
-          );
+    attempts.push({
+      step: 'open_login_page',
+      url: page.url()
+    });
+
+    await page.waitForSelector(USERNAME_SELECTOR, { timeout: TIMEOUT_MS });
+    await page.waitForSelector(PASSWORD_SELECTOR, { timeout: TIMEOUT_MS });
+    await page.waitForSelector(SUBMIT_SELECTOR, { timeout: TIMEOUT_MS });
+
+    await page.fill(USERNAME_SELECTOR, USERNAME);
+    await page.fill(PASSWORD_SELECTOR, PASSWORD);
+
+    const loginResponsePromise = page.waitForResponse(
+      (response) => {
+        const url = response.url();
+        return url.includes('accion=comprueba_usuario_password')
+          || url.includes('accion=obtener_itinerarios_externos');
+      },
+      { timeout: 15000 }
+    ).catch(() => null);
+
+    await page.click(SUBMIT_SELECTOR);
+
+    const loginResponse = await loginResponsePromise;
+    if (loginResponse && !loginResponse.ok()) {
+      const body = await loginResponse.text().catch(() => '');
+      throw createDetailedError(
+        loginResponse.status() === 500 ? 'AUTH_HTTP_500' : 'AUTH_HTTP_ERROR',
+        `la petición interna de login devolvió ${loginResponse.status()}`,
+        {
+          status: loginResponse.status(),
+          url: loginResponse.url(),
+          body_excerpt: summarizeText(body)
         }
+      );
+    }
+
+    await page.waitForURL(LOGIN_SUCCESS_URL, { timeout: TIMEOUT_MS }).catch(async () => {
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    });
+
+    const html = await page.content();
+    assertAccessiblePage(html, page.url());
+
+    authenticated = true;
+  } catch (error) {
+    attempts.push({
+      step: 'form_login',
+      result: 'error',
+      error: error instanceof Error ? error.message : 'INTERNAL_ERROR'
+    });
+
+    throw createDetailedError(
+      error?.code || 'AUTH_FAILED',
+      'no se pudo completar el login por formulario',
+      {
+        login_url: LOGIN_URL,
+        username_selector: USERNAME_SELECTOR,
+        password_selector: PASSWORD_SELECTOR,
+        submit_selector: SUBMIT_SELECTOR,
+        attempts,
+        upstream: error?.details || null
       }
-    }
+    );
+  } finally {
+    await page.close().catch(() => {});
   }
-
-  const canTryForm = LOGIN_METHOD === 'AUTO' || LOGIN_METHOD === 'FORM' || LOGIN_METHOD === 'POST';
-  if (canTryForm) {
-    try {
-      await submitLoginForm(loginPage);
-      attemptLog.push({ step: 'submit_login_form', result: 'ok', method: LOGIN_METHOD });
-      await verifyAuthenticatedBasePage();
-      authenticated = true;
-      return;
-    } catch (error) {
-      attemptLog.push({
-        step: 'submit_login_form',
-        result: 'error',
-        method: LOGIN_METHOD,
-        error: error instanceof Error ? error.message : 'INTERNAL_ERROR'
-      });
-
-      if (error?.code === 'AUTH_HTTP_500') {
-        throw createDetailedError(
-          'AUTH_HTTP_500',
-          'el login del sitio interno devolvió 500 al enviar el formulario',
-          {
-            login_url: LOGIN_URL,
-            login_field_user: LOGIN_USER_FIELD,
-            login_field_password: LOGIN_PASSWORD_FIELD,
-            attempts: attemptLog,
-            upstream: error.details || null
-          }
-        );
-      }
-    }
-  }
-
-  throw createDetailedError(
-    'AUTH_FAILED',
-    'no se pudo completar la autenticación contra el sitio interno',
-    {
-      login_url: LOGIN_URL,
-      login_method: LOGIN_METHOD,
-      attempts: attemptLog
-    }
-  );
 }
 
-function extractReadableContent(html, pageUrl) {
+async function fetchPage(urlOrPath) {
+  await ensureAuthenticated();
+
+  const page = await newPage();
+
+  try {
+    await safeGoto(page, urlOrPath || BASE_URL, 'la página solicitada');
+
+    const finalUrl = page.url();
+    const html = await page.content();
+    const visibleText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+
+    assertAccessiblePage(html, finalUrl);
+
+    return { html, finalUrl, visibleText };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+function getSnippetAround(text, query, maxLength = 260) {
+  const normalizedText = String(text || '');
+  const normalizedQuery = String(query || '').toLowerCase();
+  const index = normalizedText.toLowerCase().indexOf(normalizedQuery);
+
+  if (index < 0) {
+    return summarizeText(normalizedText, maxLength);
+  }
+
+  const start = Math.max(0, index - 90);
+  const end = Math.min(normalizedText.length, index + normalizedQuery.length + 170);
+  return summarizeText(normalizedText.slice(start, end), maxLength);
+}
+
+function buildSearchUrl(query, section) {
+  const baseSearch = section || SEARCH_PATH || '/';
+
+  if (baseSearch.includes('{query}')) {
+    return baseSearch.replace('{query}', encodeURIComponent(query));
+  }
+
+  if (!SEARCH_APPEND_QUERY) {
+    return baseSearch;
+  }
+
+  const separator = baseSearch.includes('?') ? '&' : '?';
+  return `${baseSearch}${separator}q=${encodeURIComponent(query)}`;
+}
+
+function extractReadableContent(html, pageUrl, visibleText = '') {
   const $ = cheerio.load(html);
   $('script, style, noscript').remove();
 
-  const title = $('title').first().text().trim() || $('h1').first().text().trim() || pageUrl;
+  const title = $('title').first().text().trim()
+    || $('h1').first().text().trim()
+    || pageUrl;
+
   const sections = [];
 
   $('h1, h2, h3').each((_, el) => {
@@ -443,21 +355,25 @@ function extractReadableContent(html, pageUrl) {
   });
 
   const links = [];
+
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href');
     const label = $(el).text().trim();
+
     if (!href) return;
+
     try {
-      const url = new URL(href, pageUrl).toString();
-      if (url.startsWith(BASE_URL)) {
+      const url = normalizeUrl(href);
+      if (url.startsWith(trimTrailingSlash(BASE_URL))) {
         links.push({ label: label || url, url });
       }
     } catch {
-      // ignore invalid hrefs
+      // Ignora enlaces inválidos.
     }
   });
 
-  const contentText = $('body').text().replace(/\s+\n/g, '\n').replace(/\n\s+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  const contentText = visibleText
+    || $('body').text().replace(/\s+\n/g, '\n').replace(/\n\s+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 
   return {
     title,
@@ -465,15 +381,6 @@ function extractReadableContent(html, pageUrl) {
     sections,
     links: dedupeLinks(links)
   };
-}
-
-function dedupeLinks(links) {
-  const seen = new Set();
-  return links.filter((link) => {
-    if (seen.has(link.url)) return false;
-    seen.add(link.url);
-    return true;
-  });
 }
 
 function extractTables(html) {
@@ -499,21 +406,20 @@ function extractTables(html) {
   return tables;
 }
 
-async function fetchPage(urlOrPath) {
-  await ensureAuthenticated();
-  const response = await request(urlOrPath, { method: 'GET' });
-  if (!response.ok) {
-    throw new Error(response.status === 404 ? 'PAGE_NOT_FOUND' : 'INTERNAL_ERROR');
-  }
-  const finalUrl = response.url || normalizeUrl(urlOrPath);
-  const html = await response.text();
-  assertAccessiblePage(html, finalUrl);
-  return { html, finalUrl };
+function dedupeLinks(links) {
+  const seen = new Set();
+
+  return links.filter((link) => {
+    if (!link?.url || seen.has(link.url)) return false;
+    seen.add(link.url);
+    return true;
+  });
 }
 
 function mcpError(error) {
   const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
   const code = error?.code || message.split(':')[0];
+
   return {
     content: [
       {
@@ -547,37 +453,45 @@ function createMcpServer() {
     },
     async ({ query, limit, section }) => {
       try {
-        const searchUrl = SEARCH_PATH
-          ? `${SEARCH_PATH}${SEARCH_PATH.includes('?') ? '&' : '?'}q=${encodeURIComponent(query)}`
-          : section || '/';
-
-        const { html, finalUrl } = await fetchPage(searchUrl);
-        const $ = cheerio.load(html);
+        const searchUrl = buildSearchUrl(query, section);
+        const { html, finalUrl, visibleText } = await fetchPage(searchUrl);
+        const extracted = extractReadableContent(html, finalUrl, visibleText);
         const results = [];
 
-        $('a[href]').each((_, el) => {
-          if (results.length >= limit) return false;
-          const title = $(el).text().trim();
-          const href = $(el).attr('href');
-          if (!title || !href) return;
-          const snippet = $(el).parent().text().trim().slice(0, 240);
-          const url = normalizeUrl(href);
-          if (!url.startsWith(BASE_URL)) return;
-          if (!`${title} ${snippet}`.toLowerCase().includes(query.toLowerCase())) return;
+        if (extracted.contentText.toLowerCase().includes(query.toLowerCase())) {
           results.push({
-            title,
-            url,
-            path: new URL(url).pathname,
-            snippet,
+            title: extracted.title,
+            url: finalUrl,
+            path: new URL(finalUrl).pathname,
+            snippet: getSnippetAround(extracted.contentText, query),
+            score: 1
+          });
+        }
+
+        for (const link of extracted.links) {
+          if (results.length >= limit) break;
+
+          const haystack = `${link.label} ${link.url}`.toLowerCase();
+          if (!haystack.includes(query.toLowerCase())) continue;
+
+          results.push({
+            title: link.label,
+            url: link.url,
+            path: new URL(link.url).pathname,
+            snippet: link.label,
             score: 0.5
           });
-        });
+        }
 
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ results, total: results.length, searched_from: finalUrl }, null, 2)
+              text: JSON.stringify({
+                results: results.slice(0, limit),
+                total: Math.min(results.length, limit),
+                searched_from: finalUrl
+              }, null, 2)
             }
           ]
         };
@@ -597,9 +511,9 @@ function createMcpServer() {
     async ({ url, path }) => {
       try {
         if (!url && !path) throw new Error('INVALID_URL');
-        const target = url || path;
-        const { html, finalUrl } = await fetchPage(target);
-        const extracted = extractReadableContent(html, finalUrl);
+
+        const { html, finalUrl, visibleText } = await fetchPage(url || path);
+        const extracted = extractReadableContent(html, finalUrl, visibleText);
 
         return {
           content: [
@@ -632,8 +546,8 @@ function createMcpServer() {
     },
     async ({ url, include_tables, include_links }) => {
       try {
-        const { html, finalUrl } = await fetchPage(url);
-        const extracted = extractReadableContent(html, finalUrl);
+        const { html, finalUrl, visibleText } = await fetchPage(url);
+        const extracted = extractReadableContent(html, finalUrl, visibleText);
 
         return {
           content: [
@@ -659,32 +573,27 @@ function createMcpServer() {
     'list_sections',
     'Lista secciones navegables del sitio.',
     {
-      root_path: z.string().default('/')
+      root_path: z.string().default('/inicio/itinerarios')
     },
     async ({ root_path }) => {
       try {
-        const { html } = await fetchPage(root_path);
-        const $ = cheerio.load(html);
-        const sections = [];
+        const { html, finalUrl, visibleText } = await fetchPage(root_path);
+        const extracted = extractReadableContent(html, finalUrl, visibleText);
 
-        $('a[href]').each((_, el) => {
-          const title = $(el).text().trim();
-          const href = $(el).attr('href');
-          if (!title || !href) return;
-          const url = normalizeUrl(href);
-          if (!url.startsWith(BASE_URL)) return;
-          sections.push({
-            title,
-            path: new URL(url).pathname,
-            url
-          });
-        });
+        const sections = extracted.links.map((link) => ({
+          title: link.label,
+          path: new URL(link.url).pathname,
+          url: link.url
+        }));
 
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({ sections: dedupeLinks(sections).slice(0, 100) }, null, 2)
+              text: JSON.stringify({
+                root_url: finalUrl,
+                sections: dedupeLinks(sections).slice(0, 100)
+              }, null, 2)
             }
           ]
         };
@@ -703,6 +612,7 @@ function isInitializeRequest(body) {
 
 async function createTransportSession() {
   const server = createMcpServer();
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sessionId) => {
@@ -714,6 +624,7 @@ async function createTransportSession() {
     if (transport.sessionId) {
       transports.delete(transport.sessionId);
     }
+
     await server.close();
   };
 
@@ -732,12 +643,21 @@ async function startHttpServer() {
   app.get('/health', async (_req, res) => {
     try {
       await ensureAuthenticated();
-      res.json({ ok: true, authenticated: true, base_url: BASE_URL, mcp_path: MCP_PATH });
+
+      res.json({
+        ok: true,
+        authenticated: true,
+        base_url: BASE_URL,
+        login_url: LOGIN_URL,
+        mcp_path: MCP_PATH
+      });
     } catch (error) {
       res.status(500).json({
         ok: false,
         error: error instanceof Error ? error.message : 'INTERNAL_ERROR',
+        details: error?.details || null,
         base_url: BASE_URL,
+        login_url: LOGIN_URL,
         mcp_path: MCP_PATH
       });
     }
@@ -793,6 +713,7 @@ async function startHttpServer() {
       await session.transport.handleRequest(req, res, req.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+
       if (!res.headersSent) {
         res.status(500).json({
           error: {
@@ -822,6 +743,7 @@ async function startHttpServer() {
       await session.transport.handleRequest(req, res);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
+
       if (!res.headersSent) {
         res.status(500).json({
           error: {
@@ -843,10 +765,30 @@ async function startHttpServer() {
   });
 
   const httpServer = http.createServer(app);
+
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`IA CAE Zurekin MCP escuchando en http://0.0.0.0:${PORT}${MCP_PATH}`);
   });
 }
+
+async function closeBrowser() {
+  if (browser) {
+    await browser.close().catch(() => {});
+    browser = null;
+    browserContext = null;
+    authenticated = false;
+  }
+}
+
+process.on('SIGINT', async () => {
+  await closeBrowser();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await closeBrowser();
+  process.exit(0);
+});
 
 async function start() {
   if (process.env.PORT) {
