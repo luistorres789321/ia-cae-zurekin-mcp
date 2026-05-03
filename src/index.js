@@ -20,11 +20,9 @@ const SUBMIT_SELECTOR = process.env.CAEZ_SUBMIT_SELECTOR || '#caez-login-submit'
 
 const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '/inicio/itinerarios';
 const SEARCH_APPEND_QUERY = process.env.CAEZ_SEARCH_APPEND_QUERY === 'true';
-const RAW_LOGIN_SUCCESS_URL = process.env.CAEZ_LOGIN_SUCCESS_URL || '**/inicio/itinerarios**';
-const LOGIN_SUCCESS_URLS = expandLoginSuccessPatterns(RAW_LOGIN_SUCCESS_URL);
-
+const RAW_LOGIN_SUCCESS_URL = process.env.CAEZ_LOGIN_SUCCESS_URL || '**/#/inicio/itinerarios**';
 const HEADLESS = process.env.CAEZ_HEADLESS !== 'false';
-const TIMEOUT_MS = Number(process.env.CAEZ_TIMEOUT_MS || 30000);
+const TIMEOUT_MS = Number(process.env.CAEZ_TIMEOUT_MS || 60000);
 
 const PORT = Number(process.env.PORT || 3000);
 const MCP_PATH = process.env.MCP_PATH || '/mcp';
@@ -33,36 +31,14 @@ if (!BASE_URL) {
   throw new Error('Falta CAEZ_BASE_URL en las variables de entorno.');
 }
 
-const TRUSTED_ORIGINS = Array.from(new Set(
-  [BASE_URL, LOGIN_URL].filter(Boolean).map((url) => new URL(url).origin)
-));
-
-let browser = null;
-let browserContext = null;
-let authenticated = false;
-const transports = new Map();
-
-function createDetailedError(code, message, details = {}) {
-  const error = new Error(`${code}: ${message}`);
-  error.code = code;
-  error.details = details;
-  return error;
-}
-
-function summarizeText(text, maxLength = 500) {
-  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
-}
-
-function trimTrailingSlash(value) {
-  return String(value || '').replace(/\/+$/, '');
-}
-
 const ANGULAR_ROUTE_PREFIXES = [
+  '/',
+  '/login',
   '/inicio',
-  '/itinerarios',
   '/grid-itinerario',
   '/grid-itinerario2',
   '/grid-itinerario3',
+  '/itinerarios',
   '/clientes',
   '/conductores',
   '/vehiculos',
@@ -73,147 +49,278 @@ const ANGULAR_ROUTE_PREFIXES = [
   '/crea-vehiculo',
   '/mapa-leaflet',
   '/mapa3',
-  '/plantilla-esporadico-zurekin',
   '/upload-file',
   '/ejemplo',
   '/leer-qr',
   '/seleccion-vehiculo',
-  '/fichaje'
+  '/fichaje',
+  '/plantilla-esporadico-zurekin'
 ];
 
-function isAngularRoutePath(pathname) {
-  return ANGULAR_ROUTE_PREFIXES.some((prefix) => (
-    pathname === prefix || pathname.startsWith(`${prefix}/`)
-  ));
+const LOGIN_SUCCESS_URLS = expandLoginSuccessPatterns(RAW_LOGIN_SUCCESS_URL);
+
+const TRUSTED_ORIGINS = Array.from(new Set(
+  [BASE_URL, LOGIN_URL].filter(Boolean).map((url) => new URL(url).origin)
+));
+
+let browser = null;
+let browserContext = null;
+let appPage = null;
+let authenticated = false;
+let loginPromise = null;
+let pageQueue = Promise.resolve();
+
+const transports = new Map();
+
+function createDetailedError(code, message, details = {}) {
+  const error = new Error(`${code}: ${message}`);
+  error.code = code;
+  error.details = details;
+  return error;
 }
 
-function normalizeAngularRoutePath(input) {
-  const value = String(input || '');
+function trimTrailingSlash(value) {
+  return String(value || '').replace(/\/+$/, '');
+}
 
-  if (!value || value.startsWith('/#/') || value.includes('#/')) {
-    return value;
+function summarizeText(text, maxLength = 500) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function getBase() {
+  return new URL(BASE_URL);
+}
+
+function getAppRootUrl() {
+  const base = getBase();
+  const basePath = trimTrailingSlash(base.pathname);
+  return `${base.origin}${basePath}/`;
+}
+
+function normalizeAngularRoutePath(route) {
+  let value = String(route || '/').trim();
+
+  if (value.startsWith('#')) {
+    value = value.slice(1);
   }
 
-  if (value.includes('#')) {
-    return value;
+  if (!value.startsWith('/')) {
+    value = `/${value}`;
   }
 
-  const queryIndex = value.indexOf('?');
-  const pathname = queryIndex >= 0 ? value.slice(0, queryIndex) : value;
-  const query = queryIndex >= 0 ? value.slice(queryIndex) : '';
+  return value.replace(/^\/+/, '/');
+}
 
-  if (isAngularRoutePath(pathname)) {
-    return `/#${pathname}${query}`;
+function buildAngularUrl(route) {
+  return `${getAppRootUrl()}#${normalizeAngularRoutePath(route)}`;
+}
+
+function isBackendPath(path) {
+  const value = String(path || '').toLowerCase();
+  return value.startsWith('/datos_servidor')
+    || value.startsWith('/obtenerjson')
+    || value.includes('.aspx');
+}
+
+function looksLikeFilePath(path) {
+  return /\.[a-z0-9]{2,6}($|\?)/i.test(String(path || ''));
+}
+
+function getRouteCandidate(value) {
+  let text = String(value || '').trim();
+
+  if (!text) return '';
+
+  if (text.startsWith('#/')) {
+    return text.slice(1);
   }
 
-  return value;
+  if (/^https?:\/\//i.test(text)) {
+    const url = new URL(text);
+    const base = getBase();
+    const basePath = trimTrailingSlash(base.pathname);
+
+    if (url.hash.startsWith('#/')) {
+      return url.hash.slice(1);
+    }
+
+    if (url.origin === base.origin && url.pathname.startsWith(`${basePath}/`)) {
+      return url.pathname.slice(basePath.length) || '/';
+    }
+
+    return url.pathname;
+  }
+
+  if (!text.startsWith('/')) {
+    text = `/${text}`;
+  }
+
+  return text.split('?')[0].split('#')[0];
+}
+
+function isKnownAngularPath(value) {
+  const path = getRouteCandidate(value).toLowerCase();
+
+  if (path === '' || path === '/') return true;
+  if (isBackendPath(path)) return false;
+  if (looksLikeFilePath(path)) return false;
+
+  return ANGULAR_ROUTE_PREFIXES.some((prefix) => {
+    return path === prefix || path.startsWith(`${prefix}/`);
+  });
+}
+
+function shouldTreatAsAngularRoute(value) {
+  const text = String(value || '').trim();
+
+  if (!text) return false;
+  if (text.startsWith('#/')) return true;
+  if (text === '/' || text === '') return true;
+
+  const route = getRouteCandidate(text);
+
+  if (route === '/mcp' || route === '/health') return false;
+  if (isBackendPath(route)) return false;
+  if (looksLikeFilePath(route)) return false;
+
+  return isKnownAngularPath(text) || text.startsWith('/');
 }
 
 function rewriteAbsoluteAngularUrl(input) {
-  const base = new URL(BASE_URL);
   const url = new URL(input);
+  const base = getBase();
+
+  if (url.origin !== base.origin) {
+    return input;
+  }
+
+  if (url.hash.startsWith('#/')) {
+    return `${getAppRootUrl()}${url.hash}`;
+  }
+
   const basePath = trimTrailingSlash(base.pathname);
 
-  if (url.origin !== base.origin || url.hash) {
-    return url.toString();
+  if (url.pathname === basePath || url.pathname === `${basePath}/`) {
+    return getAppRootUrl();
   }
 
-  if (basePath && url.pathname.startsWith(`${basePath}/`)) {
-    const routePath = url.pathname.slice(basePath.length);
-
-    if (isAngularRoutePath(routePath)) {
-      url.pathname = `${basePath}/`;
-      url.hash = `${routePath}${url.search}`;
-      url.search = '';
-      return url.toString();
+  if (url.pathname.startsWith(`${basePath}/`)) {
+    const route = url.pathname.slice(basePath.length);
+    if (shouldTreatAsAngularRoute(route)) {
+      return buildAngularUrl(`${route}${url.search}`);
     }
   }
 
-  if (!basePath && isAngularRoutePath(url.pathname)) {
-    const routePath = url.pathname;
-    url.pathname = '/';
-    url.hash = `${routePath}${url.search}`;
-    url.search = '';
-    return url.toString();
+  return input;
+}
+
+function normalizeUrl(input = '') {
+  const text = String(input || '').trim();
+  const base = getBase();
+
+  if (!text) {
+    return getAppRootUrl();
   }
 
-  return url.toString();
-}
-
-function expandLoginSuccessPatterns(value) {
-  const patterns = String(value || '')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-  const expanded = new Set(patterns.length ? patterns : ['**/inicio/itinerarios**']);
-
-  for (const pattern of Array.from(expanded)) {
-    if (!pattern.includes('/#/')) {
-      expanded.add(pattern.replace('/inicio/itinerarios', '/#/inicio/itinerarios'));
-      expanded.add(pattern.replace('/inicio/', '/#/inicio/'));
-    }
+  if (text.startsWith('#/')) {
+    return buildAngularUrl(text);
   }
 
-  return Array.from(expanded);
-}
-
-function globToRegExp(glob) {
-  const escaped = String(glob)
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, '___DOUBLE_STAR___')
-    .replace(/\*/g, '[^/]*')
-    .replace(/___DOUBLE_STAR___/g, '.*');
-
-  return new RegExp(`^${escaped}$`);
-}
-
-function urlMatchesAnyPattern(url, patterns) {
-  return patterns.some((pattern) => globToRegExp(pattern).test(String(url)));
-}
-
-async function waitForLoginSuccess(page) {
-  if (urlMatchesAnyPattern(page.url(), LOGIN_SUCCESS_URLS)) {
-    return;
+  if (/^https?:\/\//i.test(text)) {
+    return rewriteAbsoluteAngularUrl(new URL(text).toString());
   }
 
-  await page.waitForURL(
-    (url) => urlMatchesAnyPattern(url.toString(), LOGIN_SUCCESS_URLS),
-    { timeout: TIMEOUT_MS }
-  );
+  if (shouldTreatAsAngularRoute(text)) {
+    return buildAngularUrl(text);
+  }
+
+  if (text.startsWith('/')) {
+    return `${base.origin}${text}`;
+  }
+
+  return rewriteAbsoluteAngularUrl(new URL(text, getAppRootUrl()).toString());
 }
 
 function getDisplayPath(url) {
   const parsed = new URL(url);
-  return `${parsed.pathname}${parsed.hash || ''}`;
-}
 
-function normalizeUrl(input = '') {
-  const base = new URL(BASE_URL);
-
-  if (!input) return BASE_URL;
-
-  if (/^https?:\/\//i.test(input)) {
-    return rewriteAbsoluteAngularUrl(input);
+  if (parsed.hash.startsWith('#/')) {
+    return parsed.hash.slice(1).split('?')[0] || '/';
   }
 
-  if (input.startsWith('/')) {
-    const basePath = trimTrailingSlash(base.pathname);
-    const angularSafeInput = normalizeAngularRoutePath(input);
-    return `${base.origin}${basePath}${angularSafeInput}`;
-  }
-
-  const baseWithSlash = BASE_URL.endsWith('/') ? BASE_URL : `${BASE_URL}/`;
-  return new URL(input, baseWithSlash).toString();
+  return parsed.pathname;
 }
 
 function assertTrustedOrigin(url) {
   const origin = new URL(url).origin;
+
   if (!TRUSTED_ORIGINS.includes(origin)) {
     throw createDetailedError(
       'UNEXPECTED_ORIGIN',
       `respuesta desde origen no permitido: ${origin}`,
       { origin, trusted_origins: TRUSTED_ORIGINS }
+    );
+  }
+}
+
+function hasSelector($, selector) {
+  try {
+    return $(selector).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeLoginPage(html) {
+  const $ = cheerio.load(html);
+  const bodyText = $('body').text().toLowerCase();
+
+  const hasConfiguredUser = hasSelector($, USERNAME_SELECTOR);
+  const hasConfiguredPassword = hasSelector($, PASSWORD_SELECTOR);
+  const hasPasswordInput = $('input[type="password"]').length > 0;
+
+  const loginTextDetected = [
+    'login',
+    'log in',
+    'sign in',
+    'iniciar sesi',
+    'acceder',
+    'usuario',
+    'contrase',
+    'password'
+  ].some((token) => bodyText.includes(token));
+
+  return (hasConfiguredUser && hasConfiguredPassword)
+    || (hasPasswordInput && loginTextDetected);
+}
+
+function looksLikeAccessDenied(html) {
+  const text = cheerio.load(html)('body').text().toLowerCase();
+
+  return [
+    'access denied',
+    'forbidden',
+    'unauthorized',
+    'acceso denegado',
+    'no autorizado',
+    'permission denied'
+  ].some((token) => text.includes(token));
+}
+
+function assertAccessiblePage(html, pageUrl) {
+  if (looksLikeLoginPage(html)) {
+    throw createDetailedError(
+      'AUTH_FAILED',
+      `el sitio sigue mostrando la pantalla de login (${pageUrl})`,
+      { page_url: pageUrl }
+    );
+  }
+
+  if (looksLikeAccessDenied(html)) {
+    throw createDetailedError(
+      'AUTH_FAILED',
+      `el sitio devolvio una pantalla de acceso denegado (${pageUrl})`,
+      { page_url: pageUrl }
     );
   }
 }
@@ -243,21 +350,94 @@ async function newPage() {
   return page;
 }
 
-async function safeGoto(page, urlOrPath, contextLabel) {
-  const url = normalizeUrl(urlOrPath);
-  const response = await page.goto(url, {
-    waitUntil: 'domcontentloaded',
-    timeout: TIMEOUT_MS
+async function getAppPage() {
+  if (appPage && !appPage.isClosed()) {
+    return appPage;
+  }
+
+  appPage = await newPage();
+  return appPage;
+}
+
+async function withPageLock(task) {
+  const previous = pageQueue;
+  let release;
+
+  pageQueue = new Promise((resolve) => {
+    release = resolve;
   });
 
-  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+  await previous.catch(() => {});
+
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+function sameDocumentForHashNavigation(currentUrl, targetUrl) {
+  if (!currentUrl || currentUrl === 'about:blank') return false;
+
+  const current = new URL(currentUrl);
+  const target = new URL(targetUrl);
+
+  return current.origin === target.origin
+    && trimTrailingSlash(current.pathname) === trimTrailingSlash(target.pathname)
+    && current.search === target.search
+    && target.hash.startsWith('#/');
+}
+
+async function waitAfterNavigation(page) {
+  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+  await page.locator('body').waitFor({ state: 'attached', timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+}
+
+
+async function safeNavigate(page, urlOrPath, contextLabel, options = {}) {
+  const url = normalizeUrl(urlOrPath);
+  assertTrustedOrigin(url);
+
+  let response = null;
+  const currentUrl = page.url();
+
+  if (
+    !options.forceReload
+    && currentUrl === url
+    && currentUrl !== 'about:blank'
+  ) {
+    await waitAfterNavigation(page);
+  } else if (
+    !options.forceReload
+    && sameDocumentForHashNavigation(currentUrl, url)
+  ) {
+    const targetHash = new URL(url).hash;
+
+    await page.evaluate((hash) => {
+      if (window.location.hash !== hash) {
+        window.location.hash = hash;
+      }
+    }, targetHash);
+
+    await waitAfterNavigation(page);
+  } else {
+    response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: TIMEOUT_MS
+    });
+
+    await waitAfterNavigation(page);
+  }
+
   assertTrustedOrigin(page.url());
 
   if (response && !response.ok()) {
     const body = await response.text().catch(() => '');
+
     throw createDetailedError(
       'PAGE_HTTP_ERROR',
-      `${contextLabel} devolvió ${response.status()}`,
+      `${contextLabel} devolvio ${response.status()}`,
       {
         status: response.status(),
         url: page.url(),
@@ -269,67 +449,91 @@ async function safeGoto(page, urlOrPath, contextLabel) {
   return response;
 }
 
-function looksLikeLoginPage(html) {
-  const $ = cheerio.load(html);
-  const bodyText = $('body').text().toLowerCase();
+function globToRegExp(glob) {
+  const placeholder = '\u0000';
 
-  const hasConfiguredUser = USERNAME_SELECTOR.startsWith('#')
-    ? $(USERNAME_SELECTOR).length > 0
-    : false;
+  const escaped = String(glob)
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, placeholder)
+    .replace(/\*/g, '[^/]*')
+    .replaceAll(placeholder, '.*');
 
-  const hasConfiguredPassword = PASSWORD_SELECTOR.startsWith('#')
-    ? $(PASSWORD_SELECTOR).length > 0
-    : false;
-
-  const hasPasswordInput = $('input[type="password"]').length > 0;
-  const loginTextDetected = [
-    'login',
-    'log in',
-    'sign in',
-    'iniciar sesi',
-    'acceder',
-    'usuario',
-    'contrase',
-    'password'
-  ].some((token) => bodyText.includes(token));
-
-  return (hasConfiguredUser && hasConfiguredPassword) || (hasPasswordInput && loginTextDetected);
+  return new RegExp(`^${escaped}$`);
 }
 
-function looksLikeAccessDenied(html) {
-  const text = cheerio.load(html)('body').text().toLowerCase();
-
-  return [
-    'access denied',
-    'forbidden',
-    'unauthorized',
-    'acceso denegado',
-    'no autorizado',
-    'permission denied'
-  ].some((token) => text.includes(token));
+function urlMatchesAnyPattern(url, patterns) {
+  return patterns.some((pattern) => globToRegExp(pattern).test(url));
 }
 
-function assertAccessiblePage(html, pageUrl) {
-  if (looksLikeLoginPage(html)) {
-    throw createDetailedError(
-      'AUTH_FAILED',
-      `el sitio sigue mostrando la pantalla de login (${pageUrl})`,
-      { page_url: pageUrl }
-    );
+function expandLoginSuccessPatterns(value) {
+  const rawPatterns = String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  const patterns = new Set(rawPatterns);
+
+  for (const pattern of rawPatterns) {
+    if (pattern.includes('/inicio/itinerarios') && !pattern.includes('#/')) {
+      patterns.add(pattern.replace('/inicio/itinerarios', '/#/inicio/itinerarios'));
+    }
+
+    if (pattern.includes('/#/inicio/itinerarios')) {
+      patterns.add(pattern.replace('/#/inicio/itinerarios', '/inicio/itinerarios'));
+    }
   }
 
-  if (looksLikeAccessDenied(html)) {
-    throw createDetailedError(
-      'AUTH_FAILED',
-      `el sitio devolvió una pantalla de acceso denegado (${pageUrl})`,
-      { page_url: pageUrl }
-    );
-  }
+  patterns.add('**/#/inicio/itinerarios**');
+  patterns.add('**/inicio/itinerarios**');
+
+  return Array.from(patterns);
 }
 
-async function ensureAuthenticated() {
-  if (authenticated) return;
+async function waitForLoginSuccess(page) {
+  const deadline = Date.now() + TIMEOUT_MS;
+  let lastUrl = page.url();
 
+  while (Date.now() < deadline) {
+    await waitAfterNavigation(page);
+
+    lastUrl = page.url();
+
+    if (urlMatchesAnyPattern(lastUrl, LOGIN_SUCCESS_URLS)) {
+      return;
+    }
+
+    const html = await page.content().catch(() => '');
+
+    if (
+      html
+      && !looksLikeLoginPage(html)
+      && !looksLikeAccessDenied(html)
+      && !lastUrl.endsWith('/#/')
+    ) {
+      return;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw createDetailedError(
+    'AUTH_TIMEOUT',
+    'no se detecto navegacion correcta despues del login',
+    {
+      current_url: lastUrl,
+      expected_patterns: LOGIN_SUCCESS_URLS
+    }
+  );
+}
+
+function isLoginResponse(response) {
+  const url = response.url();
+
+  return url.includes('accion=comprueba_usuario_password')
+    || url.includes('accion=obtener_itinerarios_externos');
+}
+
+async function performLoginUnlocked() {
   if (!USERNAME || !PASSWORD) {
     throw createDetailedError(
       'AUTH_FAILED',
@@ -341,11 +545,11 @@ async function ensureAuthenticated() {
     );
   }
 
-  const page = await newPage();
+  const page = await getAppPage();
   const attempts = [];
 
   try {
-    await safeGoto(page, LOGIN_URL, 'la página de login');
+    await safeNavigate(page, LOGIN_URL, 'la pagina de login', { forceReload: true });
 
     attempts.push({
       step: 'open_login_page',
@@ -360,22 +564,20 @@ async function ensureAuthenticated() {
     await page.fill(PASSWORD_SELECTOR, PASSWORD);
 
     const loginResponsePromise = page.waitForResponse(
-      (response) => {
-        const url = response.url();
-        return url.includes('accion=comprueba_usuario_password')
-          || url.includes('accion=obtener_itinerarios_externos');
-      },
-      { timeout: 15000 }
+      isLoginResponse,
+      { timeout: 20000 }
     ).catch(() => null);
 
     await page.click(SUBMIT_SELECTOR);
 
     const loginResponse = await loginResponsePromise;
+
     if (loginResponse && !loginResponse.ok()) {
       const body = await loginResponse.text().catch(() => '');
+
       throw createDetailedError(
         loginResponse.status() === 500 ? 'AUTH_HTTP_500' : 'AUTH_HTTP_ERROR',
-        `la petición interna de login devolvió ${loginResponse.status()}`,
+        `la peticion interna de login devolvio ${loginResponse.status()}`,
         {
           status: loginResponse.status(),
           url: loginResponse.url(),
@@ -384,15 +586,15 @@ async function ensureAuthenticated() {
       );
     }
 
-    await waitForLoginSuccess(page).catch(async () => {
-      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    });
+    await waitForLoginSuccess(page);
 
     const html = await page.content();
     assertAccessiblePage(html, page.url());
 
     authenticated = true;
   } catch (error) {
+    authenticated = false;
+
     attempts.push({
       step: 'form_login',
       result: 'error',
@@ -411,29 +613,108 @@ async function ensureAuthenticated() {
         upstream: error?.details || null
       }
     );
-  } finally {
-    await page.close().catch(() => {});
   }
 }
 
-async function fetchPage(urlOrPath) {
-  await ensureAuthenticated();
+async function ensureAuthenticatedUnlocked() {
+  if (authenticated && appPage && !appPage.isClosed() && appPage.url() !== 'about:blank') {
+    const html = await appPage.content().catch(() => '');
 
-  const page = await newPage();
+    if (html && !looksLikeLoginPage(html) && !looksLikeAccessDenied(html)) {
+      return;
+    }
 
-  try {
-    await safeGoto(page, urlOrPath || BASE_URL, 'la página solicitada');
-
-    const finalUrl = page.url();
-    const html = await page.content();
-    const visibleText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
-
-    assertAccessiblePage(html, finalUrl);
-
-    return { html, finalUrl, visibleText };
-  } finally {
-    await page.close().catch(() => {});
+    authenticated = false;
   }
+
+  if (!loginPromise) {
+    loginPromise = performLoginUnlocked().finally(() => {
+      loginPromise = null;
+    });
+  }
+
+  await loginPromise;
+}
+
+async function ensureAuthenticated() {
+  return withPageLock(async () => {
+    await ensureAuthenticatedUnlocked();
+  });
+}
+
+async function applyInPageSearch(page, query) {
+  const selectors = [
+    'input[type="search"]',
+    'input[placeholder*="buscar" i]',
+    'input[aria-label*="buscar" i]',
+    'input[placeholder*="filtrar" i]',
+    'input[aria-label*="filtrar" i]'
+  ];
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+
+    for (let index = 0; index < count; index += 1) {
+      const input = locator.nth(index);
+      const visible = await input.isVisible().catch(() => false);
+      const enabled = await input.isEnabled().catch(() => false);
+
+      if (!visible || !enabled) continue;
+
+      await input.fill(query);
+      await page.keyboard.press('Enter').catch(() => {});
+      await page.waitForTimeout(700);
+      await page.waitForTimeout(1500);
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function fetchPage(urlOrPath, options = {}) {
+  return withPageLock(async () => {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await ensureAuthenticatedUnlocked();
+
+      const page = await getAppPage();
+
+      try {
+        await safeNavigate(
+          page,
+          urlOrPath || SEARCH_PATH || BASE_URL,
+          'la pagina solicitada'
+        );
+
+        if (options.searchQuery) {
+          await applyInPageSearch(page, options.searchQuery);
+        }
+
+        const finalUrl = page.url();
+        const html = await page.content();
+        const visibleText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+
+        assertAccessiblePage(html, finalUrl);
+
+        return { html, finalUrl, visibleText };
+      } catch (error) {
+        lastError = error;
+
+        if (error?.code === 'AUTH_FAILED' && attempt === 0) {
+          authenticated = false;
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw lastError || createDetailedError('INTERNAL_ERROR', 'fallo desconocido al cargar pagina');
+  });
 }
 
 function getSnippetAround(text, query, maxLength = 260) {
@@ -447,11 +728,12 @@ function getSnippetAround(text, query, maxLength = 260) {
 
   const start = Math.max(0, index - 90);
   const end = Math.min(normalizedText.length, index + normalizedQuery.length + 170);
+
   return summarizeText(normalizedText.slice(start, end), maxLength);
 }
 
 function buildSearchUrl(query, section) {
-  const baseSearch = section || SEARCH_PATH || '/';
+  const baseSearch = section || SEARCH_PATH || '/inicio/itinerarios';
 
   if (baseSearch.includes('{query}')) {
     return baseSearch.replace('{query}', encodeURIComponent(query));
@@ -463,6 +745,16 @@ function buildSearchUrl(query, section) {
 
   const separator = baseSearch.includes('?') ? '&' : '?';
   return `${baseSearch}${separator}q=${encodeURIComponent(query)}`;
+}
+
+function dedupeLinks(links) {
+  const seen = new Set();
+
+  return links.filter((link) => {
+    if (!link?.url || seen.has(link.url)) return false;
+    seen.add(link.url);
+    return true;
+  });
 }
 
 function extractReadableContent(html, pageUrl, visibleText = '') {
@@ -497,20 +789,26 @@ function extractReadableContent(html, pageUrl, visibleText = '') {
     const href = $(el).attr('href');
     const label = $(el).text().trim();
 
-    if (!href) return;
+    if (!href || /^(javascript:|mailto:|tel:)/i.test(href)) return;
 
     try {
       const url = normalizeUrl(href);
-      if (url.startsWith(trimTrailingSlash(BASE_URL))) {
+      const origin = new URL(url).origin;
+
+      if (TRUSTED_ORIGINS.includes(origin)) {
         links.push({ label: label || url, url });
       }
     } catch {
-      // Ignora enlaces inválidos.
+      // Ignora enlaces invalidos.
     }
   });
 
   const contentText = visibleText
-    || $('body').text().replace(/\s+\n/g, '\n').replace(/\n\s+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    || $('body').text()
+      .replace(/\s+\n/g, '\n')
+      .replace(/\n\s+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
 
   return {
     title,
@@ -526,13 +824,27 @@ function extractTables(html) {
 
   $('table').each((_, table) => {
     const headers = [];
-    $(table).find('thead th').each((__, th) => headers.push($(th).text().trim()));
-
     const rows = [];
-    $(table).find('tbody tr').each((__, tr) => {
-      const row = [];
-      $(tr).find('td').each((___, td) => row.push($(td).text().trim()));
-      if (row.length) rows.push(row);
+
+    $(table).find('tr').each((__, tr) => {
+      const headerCells = [];
+      const rowCells = [];
+
+      $(tr).find('th').each((___, th) => {
+        headerCells.push($(th).text().trim());
+      });
+
+      $(tr).find('td').each((___, td) => {
+        rowCells.push($(td).text().trim());
+      });
+
+      if (headerCells.length && !headers.length) {
+        headers.push(...headerCells);
+      }
+
+      if (rowCells.length) {
+        rows.push(rowCells);
+      }
     });
 
     if (headers.length || rows.length) {
@@ -543,19 +855,9 @@ function extractTables(html) {
   return tables;
 }
 
-function dedupeLinks(links) {
-  const seen = new Set();
-
-  return links.filter((link) => {
-    if (!link?.url || seen.has(link.url)) return false;
-    seen.add(link.url);
-    return true;
-  });
-}
-
 function mcpError(error) {
   const message = error instanceof Error ? error.message : 'INTERNAL_ERROR';
-  const code = error?.code || message.split(':')[0];
+  const code = error?.code || message.split(':')[0] || 'INTERNAL_ERROR';
 
   return {
     content: [
@@ -591,7 +893,7 @@ function createMcpServer() {
     async ({ query, limit, section }) => {
       try {
         const searchUrl = buildSearchUrl(query, section);
-        const { html, finalUrl, visibleText } = await fetchPage(searchUrl);
+        const { html, finalUrl, visibleText } = await fetchPage(searchUrl, { searchQuery: query });
         const extracted = extractReadableContent(html, finalUrl, visibleText);
         const results = [];
 
@@ -640,7 +942,7 @@ function createMcpServer() {
 
   server.tool(
     'get_page',
-    'Obtiene una página concreta del sitio.',
+    'Obtiene una pagina concreta del sitio.',
     {
       url: z.string().optional(),
       path: z.string().optional()
@@ -675,7 +977,7 @@ function createMcpServer() {
 
   server.tool(
     'extract_page_content',
-    'Extrae el contenido estructurado de una página.',
+    'Extrae el contenido estructurado de una pagina.',
     {
       url: z.string(),
       include_tables: z.boolean().default(true),
@@ -781,11 +1083,14 @@ async function startHttpServer() {
     try {
       await ensureAuthenticated();
 
+      const page = await getAppPage();
+
       res.json({
         ok: true,
         authenticated: true,
         base_url: BASE_URL,
         login_url: LOGIN_URL,
+        current_url: page.url(),
         search_path: normalizeUrl(SEARCH_PATH),
         mcp_path: MCP_PATH
       });
@@ -796,7 +1101,7 @@ async function startHttpServer() {
         details: error?.details || null,
         base_url: BASE_URL,
         login_url: LOGIN_URL,
-        search_path: SEARCH_PATH,
+        search_path: normalizeUrl(SEARCH_PATH),
         mcp_path: MCP_PATH
       });
     }
@@ -830,7 +1135,7 @@ async function startHttpServer() {
           res.status(404).json({
             error: {
               code: 'SESSION_NOT_FOUND',
-              message: 'La sesión MCP no existe o ha caducado.'
+              message: 'La sesion MCP no existe o ha caducado.'
             }
           });
           return;
@@ -840,7 +1145,7 @@ async function startHttpServer() {
           res.status(400).json({
             error: {
               code: 'INVALID_REQUEST',
-              message: 'La primera petición MCP debe ser initialize.'
+              message: 'La primera peticion MCP debe ser initialize.'
             }
           });
           return;
@@ -873,7 +1178,7 @@ async function startHttpServer() {
         res.status(404).json({
           error: {
             code: 'SESSION_NOT_FOUND',
-            message: 'No se encontró la sesión MCP indicada.'
+            message: 'No se encontro la sesion MCP indicada.'
           }
         });
         return;
@@ -911,12 +1216,20 @@ async function startHttpServer() {
 }
 
 async function closeBrowser() {
+  if (appPage && !appPage.isClosed()) {
+    await appPage.close().catch(() => {});
+  }
+
+  appPage = null;
+
   if (browser) {
     await browser.close().catch(() => {});
-    browser = null;
-    browserContext = null;
-    authenticated = false;
   }
+
+  browser = null;
+  browserContext = null;
+  authenticated = false;
+  loginPromise = null;
 }
 
 process.on('SIGINT', async () => {
