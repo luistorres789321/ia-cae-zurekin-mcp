@@ -20,7 +20,9 @@ const SUBMIT_SELECTOR = process.env.CAEZ_SUBMIT_SELECTOR || '#caez-login-submit'
 
 const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '/inicio/itinerarios';
 const SEARCH_APPEND_QUERY = process.env.CAEZ_SEARCH_APPEND_QUERY === 'true';
-const LOGIN_SUCCESS_URL = process.env.CAEZ_LOGIN_SUCCESS_URL || '**/inicio/itinerarios**';
+const RAW_LOGIN_SUCCESS_URL = process.env.CAEZ_LOGIN_SUCCESS_URL || '**/inicio/itinerarios**';
+const LOGIN_SUCCESS_URLS = expandLoginSuccessPatterns(RAW_LOGIN_SUCCESS_URL);
+
 const HEADLESS = process.env.CAEZ_HEADLESS !== 'false';
 const TIMEOUT_MS = Number(process.env.CAEZ_TIMEOUT_MS || 30000);
 
@@ -55,18 +57,150 @@ function trimTrailingSlash(value) {
   return String(value || '').replace(/\/+$/, '');
 }
 
+const ANGULAR_ROUTE_PREFIXES = [
+  '/inicio',
+  '/itinerarios',
+  '/grid-itinerario',
+  '/grid-itinerario2',
+  '/grid-itinerario3',
+  '/clientes',
+  '/conductores',
+  '/vehiculos',
+  '/historico',
+  '/crea-itinerario',
+  '/crea-cliente',
+  '/crea-conductor',
+  '/crea-vehiculo',
+  '/mapa-leaflet',
+  '/mapa3',
+  '/plantilla-esporadico-zurekin',
+  '/upload-file',
+  '/ejemplo',
+  '/leer-qr',
+  '/seleccion-vehiculo',
+  '/fichaje'
+];
+
+function isAngularRoutePath(pathname) {
+  return ANGULAR_ROUTE_PREFIXES.some((prefix) => (
+    pathname === prefix || pathname.startsWith(`${prefix}/`)
+  ));
+}
+
+function normalizeAngularRoutePath(input) {
+  const value = String(input || '');
+
+  if (!value || value.startsWith('/#/') || value.includes('#/')) {
+    return value;
+  }
+
+  if (value.includes('#')) {
+    return value;
+  }
+
+  const queryIndex = value.indexOf('?');
+  const pathname = queryIndex >= 0 ? value.slice(0, queryIndex) : value;
+  const query = queryIndex >= 0 ? value.slice(queryIndex) : '';
+
+  if (isAngularRoutePath(pathname)) {
+    return `/#${pathname}${query}`;
+  }
+
+  return value;
+}
+
+function rewriteAbsoluteAngularUrl(input) {
+  const base = new URL(BASE_URL);
+  const url = new URL(input);
+  const basePath = trimTrailingSlash(base.pathname);
+
+  if (url.origin !== base.origin || url.hash) {
+    return url.toString();
+  }
+
+  if (basePath && url.pathname.startsWith(`${basePath}/`)) {
+    const routePath = url.pathname.slice(basePath.length);
+
+    if (isAngularRoutePath(routePath)) {
+      url.pathname = `${basePath}/`;
+      url.hash = `${routePath}${url.search}`;
+      url.search = '';
+      return url.toString();
+    }
+  }
+
+  if (!basePath && isAngularRoutePath(url.pathname)) {
+    const routePath = url.pathname;
+    url.pathname = '/';
+    url.hash = `${routePath}${url.search}`;
+    url.search = '';
+    return url.toString();
+  }
+
+  return url.toString();
+}
+
+function expandLoginSuccessPatterns(value) {
+  const patterns = String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  const expanded = new Set(patterns.length ? patterns : ['**/inicio/itinerarios**']);
+
+  for (const pattern of Array.from(expanded)) {
+    if (!pattern.includes('/#/')) {
+      expanded.add(pattern.replace('/inicio/itinerarios', '/#/inicio/itinerarios'));
+      expanded.add(pattern.replace('/inicio/', '/#/inicio/'));
+    }
+  }
+
+  return Array.from(expanded);
+}
+
+function globToRegExp(glob) {
+  const escaped = String(glob)
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '___DOUBLE_STAR___')
+    .replace(/\*/g, '[^/]*')
+    .replace(/___DOUBLE_STAR___/g, '.*');
+
+  return new RegExp(`^${escaped}$`);
+}
+
+function urlMatchesAnyPattern(url, patterns) {
+  return patterns.some((pattern) => globToRegExp(pattern).test(String(url)));
+}
+
+async function waitForLoginSuccess(page) {
+  if (urlMatchesAnyPattern(page.url(), LOGIN_SUCCESS_URLS)) {
+    return;
+  }
+
+  await page.waitForURL(
+    (url) => urlMatchesAnyPattern(url.toString(), LOGIN_SUCCESS_URLS),
+    { timeout: TIMEOUT_MS }
+  );
+}
+
+function getDisplayPath(url) {
+  const parsed = new URL(url);
+  return `${parsed.pathname}${parsed.hash || ''}`;
+}
+
 function normalizeUrl(input = '') {
   const base = new URL(BASE_URL);
 
   if (!input) return BASE_URL;
 
   if (/^https?:\/\//i.test(input)) {
-    return new URL(input).toString();
+    return rewriteAbsoluteAngularUrl(input);
   }
 
   if (input.startsWith('/')) {
     const basePath = trimTrailingSlash(base.pathname);
-    return `${base.origin}${basePath}${input}`;
+    const angularSafeInput = normalizeAngularRoutePath(input);
+    return `${base.origin}${basePath}${angularSafeInput}`;
   }
 
   const baseWithSlash = BASE_URL.endsWith('/') ? BASE_URL : `${BASE_URL}/`;
@@ -86,7 +220,10 @@ function assertTrustedOrigin(url) {
 
 async function getBrowserContext() {
   if (!browser) {
-    browser = await chromium.launch({ headless: HEADLESS });
+    browser = await chromium.launch({
+      headless: HEADLESS,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
   }
 
   if (!browserContext) {
@@ -247,7 +384,7 @@ async function ensureAuthenticated() {
       );
     }
 
-    await page.waitForURL(LOGIN_SUCCESS_URL, { timeout: TIMEOUT_MS }).catch(async () => {
+    await waitForLoginSuccess(page).catch(async () => {
       await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     });
 
@@ -462,7 +599,7 @@ function createMcpServer() {
           results.push({
             title: extracted.title,
             url: finalUrl,
-            path: new URL(finalUrl).pathname,
+            path: getDisplayPath(finalUrl),
             snippet: getSnippetAround(extracted.contentText, query),
             score: 1
           });
@@ -477,7 +614,7 @@ function createMcpServer() {
           results.push({
             title: link.label,
             url: link.url,
-            path: new URL(link.url).pathname,
+            path: getDisplayPath(link.url),
             snippet: link.label,
             score: 0.5
           });
@@ -522,7 +659,7 @@ function createMcpServer() {
               text: JSON.stringify({
                 title: extracted.title,
                 url: finalUrl,
-                path: new URL(finalUrl).pathname,
+                path: getDisplayPath(finalUrl),
                 content_text: extracted.contentText,
                 content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
                 links: extracted.links
@@ -582,7 +719,7 @@ function createMcpServer() {
 
         const sections = extracted.links.map((link) => ({
           title: link.label,
-          path: new URL(link.url).pathname,
+          path: getDisplayPath(link.url),
           url: link.url
         }));
 
@@ -649,6 +786,7 @@ async function startHttpServer() {
         authenticated: true,
         base_url: BASE_URL,
         login_url: LOGIN_URL,
+        search_path: normalizeUrl(SEARCH_PATH),
         mcp_path: MCP_PATH
       });
     } catch (error) {
@@ -658,6 +796,7 @@ async function startHttpServer() {
         details: error?.details || null,
         base_url: BASE_URL,
         login_url: LOGIN_URL,
+        search_path: SEARCH_PATH,
         mcp_path: MCP_PATH
       });
     }
