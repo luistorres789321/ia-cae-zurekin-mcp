@@ -18,11 +18,12 @@ const USERNAME_SELECTOR = process.env.CAEZ_USERNAME_SELECTOR || '#caez-usuario';
 const PASSWORD_SELECTOR = process.env.CAEZ_PASSWORD_SELECTOR || '#caez-password';
 const SUBMIT_SELECTOR = process.env.CAEZ_SUBMIT_SELECTOR || '#caez-login-submit';
 
-const SEARCH_PATH = process.env.CAEZ_SEARCH_PATH || '/inicio/itinerarios';
-const SEARCH_APPEND_QUERY = process.env.CAEZ_SEARCH_APPEND_QUERY === 'true';
-const RAW_LOGIN_SUCCESS_URL = process.env.CAEZ_LOGIN_SUCCESS_URL || '**/#/inicio/itinerarios**';
+const ITINERARIOS_MENU_SELECTOR = process.env.CAEZ_ITINERARIOS_MENU_SELECTOR || '#caez-menu-itinerarios';
+const ITINERARIOS_SEARCH_SELECTOR = process.env.CAEZ_ITINERARIOS_SEARCH_SELECTOR || '#caez-itinerarios-buscar';
+
+const DEFAULT_SECTION = process.env.CAEZ_DEFAULT_SECTION || 'itinerarios';
 const HEADLESS = process.env.CAEZ_HEADLESS !== 'false';
-const TIMEOUT_MS = Number(process.env.CAEZ_TIMEOUT_MS || 60000);
+const TIMEOUT_MS = Number(process.env.CAEZ_TIMEOUT_MS || 30000);
 
 const PORT = Number(process.env.PORT || 3000);
 const MCP_PATH = process.env.MCP_PATH || '/mcp';
@@ -31,37 +32,49 @@ if (!BASE_URL) {
   throw new Error('Falta CAEZ_BASE_URL en las variables de entorno.');
 }
 
-const ANGULAR_ROUTE_PREFIXES = [
-  '/',
-  '/login',
-  '/inicio',
-  '/grid-itinerario',
-  '/grid-itinerario2',
-  '/grid-itinerario3',
-  '/itinerarios',
-  '/clientes',
-  '/conductores',
-  '/vehiculos',
-  '/historico',
-  '/crea-itinerario',
-  '/crea-cliente',
-  '/crea-conductor',
-  '/crea-vehiculo',
-  '/mapa-leaflet',
-  '/mapa3',
-  '/upload-file',
-  '/ejemplo',
-  '/leer-qr',
-  '/seleccion-vehiculo',
-  '/fichaje',
-  '/plantilla-esporadico-zurekin'
-];
-
-const LOGIN_SUCCESS_URLS = expandLoginSuccessPatterns(RAW_LOGIN_SUCCESS_URL);
-
 const TRUSTED_ORIGINS = Array.from(new Set(
   [BASE_URL, LOGIN_URL].filter(Boolean).map((url) => new URL(url).origin)
 ));
+
+const UI_SECTIONS = {
+  itinerarios: {
+    title: 'Itinerarios',
+    menuSelector: ITINERARIOS_MENU_SELECTOR,
+    readySelector: ITINERARIOS_SEARCH_SELECTOR,
+    labels: [/itinerarios/i]
+  },
+  sugerencias: { title: 'Sugerencias', labels: [/sugerencias/i] },
+  usuarios: { title: 'Claves', labels: [/claves/i] },
+  vehiculos: { title: 'Vehiculos', labels: [/vehiculos/i] },
+  'diagnostico-vehiculos': { title: 'Diagnostico', labels: [/diagnostico/i] },
+  clientes: { title: 'Clientes', labels: [/clientes/i] },
+  municipios: { title: 'Municipios', labels: [/municipios/i] },
+  conductores: { title: 'Personal', labels: [/personal/i] },
+  fichajes: { title: 'Fichajes', labels: [/fichajes/i] },
+  estadistica: { title: 'Estadistica', labels: [/estadistica/i] },
+  esporadicos: { title: 'Esporadicos', labels: [/esporadicos/i] },
+  'usuarios-traslado': { title: 'Usuarios', labels: [/usuarios/i] },
+  consola: { title: 'Asistente', labels: [/asistente/i] },
+  arquetipos: { title: 'Arquetipos', labels: [/arquetipos/i] },
+  inspeccion: { title: 'Inspeccion', labels: [/inspeccion/i] },
+  siguebus: { title: 'Pwd siguebus', labels: [/pwd\s*siguebus/i, /siguebus/i] },
+  alertas: { title: 'Alertas', labels: [/alertas/i] },
+  'alertas-moviles': { title: 'Moviles alerta', labels: [/moviles\s*alerta/i, /moviles/i] }
+};
+
+const SECTION_ALIASES = new Map([
+  ['inicio', 'itinerarios'],
+  ['inicio/itinerarios', 'itinerarios'],
+  ['itinerario', 'itinerarios'],
+  ['claves', 'usuarios'],
+  ['personal', 'conductores'],
+  ['diagnostico', 'diagnostico-vehiculos'],
+  ['moviles-alerta', 'alertas-moviles'],
+  ['moviles', 'alertas-moviles'],
+  ['pwd-siguebus', 'siguebus'],
+  ['passwords-siguebus', 'siguebus'],
+  ['asistente', 'consola']
+]);
 
 let browser = null;
 let browserContext = null;
@@ -79,176 +92,20 @@ function createDetailedError(code, message, details = {}) {
   return error;
 }
 
-function trimTrailingSlash(value) {
-  return String(value || '').replace(/\/+$/, '');
-}
-
 function summarizeText(text, maxLength = 500) {
-  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
 }
 
-function getBase() {
-  return new URL(BASE_URL);
-}
-
-function getAppRootUrl() {
-  const base = getBase();
-  const basePath = trimTrailingSlash(base.pathname);
-  return `${base.origin}${basePath}/`;
-}
-
-function normalizeAngularRoutePath(route) {
-  let value = String(route || '/').trim();
-
-  if (value.startsWith('#')) {
-    value = value.slice(1);
-  }
-
-  if (!value.startsWith('/')) {
-    value = `/${value}`;
-  }
-
-  return value.replace(/^\/+/, '/');
-}
-
-function buildAngularUrl(route) {
-  return `${getAppRootUrl()}#${normalizeAngularRoutePath(route)}`;
-}
-
-function isBackendPath(path) {
-  const value = String(path || '').toLowerCase();
-  return value.startsWith('/datos_servidor')
-    || value.startsWith('/obtenerjson')
-    || value.includes('.aspx');
-}
-
-function looksLikeFilePath(path) {
-  return /\.[a-z0-9]{2,6}($|\?)/i.test(String(path || ''));
-}
-
-function getRouteCandidate(value) {
-  let text = String(value || '').trim();
-
-  if (!text) return '';
-
-  if (text.startsWith('#/')) {
-    return text.slice(1);
-  }
-
-  if (/^https?:\/\//i.test(text)) {
-    const url = new URL(text);
-    const base = getBase();
-    const basePath = trimTrailingSlash(base.pathname);
-
-    if (url.hash.startsWith('#/')) {
-      return url.hash.slice(1);
-    }
-
-    if (url.origin === base.origin && url.pathname.startsWith(`${basePath}/`)) {
-      return url.pathname.slice(basePath.length) || '/';
-    }
-
-    return url.pathname;
-  }
-
-  if (!text.startsWith('/')) {
-    text = `/${text}`;
-  }
-
-  return text.split('?')[0].split('#')[0];
-}
-
-function isKnownAngularPath(value) {
-  const path = getRouteCandidate(value).toLowerCase();
-
-  if (path === '' || path === '/') return true;
-  if (isBackendPath(path)) return false;
-  if (looksLikeFilePath(path)) return false;
-
-  return ANGULAR_ROUTE_PREFIXES.some((prefix) => {
-    return path === prefix || path.startsWith(`${prefix}/`);
-  });
-}
-
-function shouldTreatAsAngularRoute(value) {
-  const text = String(value || '').trim();
-
-  if (!text) return false;
-  if (text.startsWith('#/')) return true;
-  if (text === '/' || text === '') return true;
-
-  const route = getRouteCandidate(text);
-
-  if (route === '/mcp' || route === '/health') return false;
-  if (isBackendPath(route)) return false;
-  if (looksLikeFilePath(route)) return false;
-
-  return isKnownAngularPath(text) || text.startsWith('/');
-}
-
-function rewriteAbsoluteAngularUrl(input) {
-  const url = new URL(input);
-  const base = getBase();
-
-  if (url.origin !== base.origin) {
-    return input;
-  }
-
-  if (url.hash.startsWith('#/')) {
-    return `${getAppRootUrl()}${url.hash}`;
-  }
-
-  const basePath = trimTrailingSlash(base.pathname);
-
-  if (url.pathname === basePath || url.pathname === `${basePath}/`) {
-    return getAppRootUrl();
-  }
-
-  if (url.pathname.startsWith(`${basePath}/`)) {
-    const route = url.pathname.slice(basePath.length);
-    if (shouldTreatAsAngularRoute(route)) {
-      return buildAngularUrl(`${route}${url.search}`);
-    }
-  }
-
-  return input;
-}
-
-function normalizeUrl(input = '') {
-  const text = String(input || '').trim();
-  const base = getBase();
-
-  if (!text) {
-    return getAppRootUrl();
-  }
-
-  if (text.startsWith('#/')) {
-    return buildAngularUrl(text);
-  }
-
-  if (/^https?:\/\//i.test(text)) {
-    return rewriteAbsoluteAngularUrl(new URL(text).toString());
-  }
-
-  if (shouldTreatAsAngularRoute(text)) {
-    return buildAngularUrl(text);
-  }
-
-  if (text.startsWith('/')) {
-    return `${base.origin}${text}`;
-  }
-
-  return rewriteAbsoluteAngularUrl(new URL(text, getAppRootUrl()).toString());
-}
-
-function getDisplayPath(url) {
-  const parsed = new URL(url);
-
-  if (parsed.hash.startsWith('#/')) {
-    return parsed.hash.slice(1).split('?')[0] || '/';
-  }
-
-  return parsed.pathname;
+function normalizeKey(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/\s+/g, '-')
+    .toLowerCase();
 }
 
 function assertTrustedOrigin(url) {
@@ -273,7 +130,7 @@ function hasSelector($, selector) {
 
 function looksLikeLoginPage(html) {
   const $ = cheerio.load(html);
-  const bodyText = $('body').text().toLowerCase();
+  const text = $('body').text().toLowerCase();
 
   const hasConfiguredUser = hasSelector($, USERNAME_SELECTOR);
   const hasConfiguredPassword = hasSelector($, PASSWORD_SELECTOR);
@@ -288,7 +145,7 @@ function looksLikeLoginPage(html) {
     'usuario',
     'contrase',
     'password'
-  ].some((token) => bodyText.includes(token));
+  ].some((token) => text.includes(token));
 
   return (hasConfiguredUser && hasConfiguredPassword)
     || (hasPasswordInput && loginTextDetected);
@@ -376,154 +233,9 @@ async function withPageLock(task) {
   }
 }
 
-function sameDocumentForHashNavigation(currentUrl, targetUrl) {
-  if (!currentUrl || currentUrl === 'about:blank') return false;
-
-  const current = new URL(currentUrl);
-  const target = new URL(targetUrl);
-
-  return current.origin === target.origin
-    && trimTrailingSlash(current.pathname) === trimTrailingSlash(target.pathname)
-    && current.search === target.search
-    && target.hash.startsWith('#/');
-}
-
-async function waitAfterNavigation(page) {
-  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+async function waitAfterUiAction(page, delay = 1000) {
   await page.locator('body').waitFor({ state: 'attached', timeout: 10000 }).catch(() => {});
-  await page.waitForTimeout(1500);
-}
-
-
-async function safeNavigate(page, urlOrPath, contextLabel, options = {}) {
-  const url = normalizeUrl(urlOrPath);
-  assertTrustedOrigin(url);
-
-  let response = null;
-  const currentUrl = page.url();
-
-  if (
-    !options.forceReload
-    && currentUrl === url
-    && currentUrl !== 'about:blank'
-  ) {
-    await waitAfterNavigation(page);
-  } else if (
-    !options.forceReload
-    && sameDocumentForHashNavigation(currentUrl, url)
-  ) {
-    const targetHash = new URL(url).hash;
-
-    await page.evaluate((hash) => {
-      if (window.location.hash !== hash) {
-        window.location.hash = hash;
-      }
-    }, targetHash);
-
-    await waitAfterNavigation(page);
-  } else {
-    response = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: TIMEOUT_MS
-    });
-
-    await waitAfterNavigation(page);
-  }
-
-  assertTrustedOrigin(page.url());
-
-  if (response && !response.ok()) {
-    const body = await response.text().catch(() => '');
-
-    throw createDetailedError(
-      'PAGE_HTTP_ERROR',
-      `${contextLabel} devolvio ${response.status()}`,
-      {
-        status: response.status(),
-        url: page.url(),
-        body_excerpt: summarizeText(body)
-      }
-    );
-  }
-
-  return response;
-}
-
-function globToRegExp(glob) {
-  const placeholder = '\u0000';
-
-  const escaped = String(glob)
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*/g, placeholder)
-    .replace(/\*/g, '[^/]*')
-    .replaceAll(placeholder, '.*');
-
-  return new RegExp(`^${escaped}$`);
-}
-
-function urlMatchesAnyPattern(url, patterns) {
-  return patterns.some((pattern) => globToRegExp(pattern).test(url));
-}
-
-function expandLoginSuccessPatterns(value) {
-  const rawPatterns = String(value || '')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-  const patterns = new Set(rawPatterns);
-
-  for (const pattern of rawPatterns) {
-    if (pattern.includes('/inicio/itinerarios') && !pattern.includes('#/')) {
-      patterns.add(pattern.replace('/inicio/itinerarios', '/#/inicio/itinerarios'));
-    }
-
-    if (pattern.includes('/#/inicio/itinerarios')) {
-      patterns.add(pattern.replace('/#/inicio/itinerarios', '/inicio/itinerarios'));
-    }
-  }
-
-  patterns.add('**/#/inicio/itinerarios**');
-  patterns.add('**/inicio/itinerarios**');
-
-  return Array.from(patterns);
-}
-
-async function waitForLoginSuccess(page) {
-  const deadline = Date.now() + TIMEOUT_MS;
-  let lastUrl = page.url();
-
-  while (Date.now() < deadline) {
-    await waitAfterNavigation(page);
-
-    lastUrl = page.url();
-
-    if (urlMatchesAnyPattern(lastUrl, LOGIN_SUCCESS_URLS)) {
-      return;
-    }
-
-    const html = await page.content().catch(() => '');
-
-    if (
-      html
-      && !looksLikeLoginPage(html)
-      && !looksLikeAccessDenied(html)
-      && !lastUrl.endsWith('/#/')
-    ) {
-      return;
-    }
-
-    await page.waitForTimeout(500);
-  }
-
-  throw createDetailedError(
-    'AUTH_TIMEOUT',
-    'no se detecto navegacion correcta despues del login',
-    {
-      current_url: lastUrl,
-      expected_patterns: LOGIN_SUCCESS_URLS
-    }
-  );
+  await page.waitForTimeout(delay);
 }
 
 function isLoginResponse(response) {
@@ -531,6 +243,118 @@ function isLoginResponse(response) {
 
   return url.includes('accion=comprueba_usuario_password')
     || url.includes('accion=obtener_itinerarios_externos');
+}
+
+async function isLoggedInPage(page) {
+  const html = await page.content().catch(() => '');
+
+  if (!html || looksLikeLoginPage(html) || looksLikeAccessDenied(html)) {
+    return false;
+  }
+
+  const menuCount = await page.locator(ITINERARIOS_MENU_SELECTOR).count().catch(() => 0);
+  if (menuCount > 0) return true;
+
+  return false;
+}
+
+async function clickSectionButton(page, sectionName) {
+  const section = UI_SECTIONS[sectionName];
+
+  if (!section) {
+    throw createDetailedError(
+      'INVALID_SECTION',
+      `seccion no soportada: ${sectionName}`,
+      { section: sectionName }
+    );
+  }
+
+  if (section.menuSelector) {
+    const locator = page.locator(section.menuSelector).first();
+    const count = await locator.count().catch(() => 0);
+
+    if (count > 0) {
+      await locator.click({ timeout: TIMEOUT_MS });
+      return;
+    }
+  }
+
+  for (const label of section.labels || []) {
+    const button = page.getByRole('button', { name: label }).first();
+    const count = await button.count().catch(() => 0);
+
+    if (count > 0) {
+      await button.click({ timeout: TIMEOUT_MS });
+      return;
+    }
+  }
+
+  throw createDetailedError(
+    'UI_NAVIGATION_FAILED',
+    `no se encontro el boton de menu para ${sectionName}`,
+    { section: sectionName, title: section.title }
+  );
+}
+
+async function waitForSectionReady(page, sectionName) {
+  const section = UI_SECTIONS[sectionName];
+
+  if (section?.readySelector) {
+    const ready = page.locator(section.readySelector).first();
+
+    try {
+      await ready.waitFor({ state: 'attached', timeout: 15000 });
+      return;
+    } catch {
+      // Continua con espera por texto.
+    }
+  }
+
+  if (section?.title) {
+    await page.getByText(section.title, { exact: false }).first()
+      .waitFor({ state: 'attached', timeout: 10000 })
+      .catch(() => {});
+  }
+
+  await waitAfterUiAction(page, 1200);
+}
+
+async function goToSectionThroughUiUnlocked(page, sectionName = DEFAULT_SECTION) {
+  await page.waitForSelector(ITINERARIOS_MENU_SELECTOR, { timeout: TIMEOUT_MS });
+
+  await clickSectionButton(page, sectionName);
+  await waitAfterUiAction(page, 1000);
+  await waitForSectionReady(page, sectionName);
+
+  const html = await page.content();
+  assertAccessiblePage(html, page.url());
+}
+
+async function waitForLoggedShell(page) {
+  const deadline = Date.now() + TIMEOUT_MS;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    try {
+      if (await isLoggedInPage(page)) {
+        await goToSectionThroughUiUnlocked(page, DEFAULT_SECTION);
+        return;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw createDetailedError(
+    'AUTH_TIMEOUT',
+    'no se detecto la interfaz autenticada despues del login',
+    {
+      current_url: page.url(),
+      last_error: lastError instanceof Error ? lastError.message : null
+    }
+  );
 }
 
 async function performLoginUnlocked() {
@@ -549,7 +373,21 @@ async function performLoginUnlocked() {
   const attempts = [];
 
   try {
-    await safeNavigate(page, LOGIN_URL, 'la pagina de login', { forceReload: true });
+    const response = await page.goto(LOGIN_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: TIMEOUT_MS
+    });
+
+    await waitAfterUiAction(page, 1000);
+    assertTrustedOrigin(page.url());
+
+    if (response && !response.ok()) {
+      throw createDetailedError(
+        'LOGIN_PAGE_HTTP_ERROR',
+        `la pagina de login devolvio ${response.status()}`,
+        { status: response.status(), url: response.url() }
+      );
+    }
 
     attempts.push({
       step: 'open_login_page',
@@ -565,7 +403,7 @@ async function performLoginUnlocked() {
 
     const loginResponsePromise = page.waitForResponse(
       isLoginResponse,
-      { timeout: 20000 }
+      { timeout: 15000 }
     ).catch(() => null);
 
     await page.click(SUBMIT_SELECTOR);
@@ -586,11 +424,7 @@ async function performLoginUnlocked() {
       );
     }
 
-    await waitForLoginSuccess(page);
-
-    const html = await page.content();
-    assertAccessiblePage(html, page.url());
-
+    await waitForLoggedShell(page);
     authenticated = true;
   } catch (error) {
     authenticated = false;
@@ -617,15 +451,11 @@ async function performLoginUnlocked() {
 }
 
 async function ensureAuthenticatedUnlocked() {
-  if (authenticated && appPage && !appPage.isClosed() && appPage.url() !== 'about:blank') {
-    const html = await appPage.content().catch(() => '');
-
-    if (html && !looksLikeLoginPage(html) && !looksLikeAccessDenied(html)) {
-      return;
-    }
-
-    authenticated = false;
+  if (authenticated && appPage && !appPage.isClosed() && await isLoggedInPage(appPage)) {
+    return;
   }
+
+  authenticated = false;
 
   if (!loginPromise) {
     loginPromise = performLoginUnlocked().finally(() => {
@@ -642,14 +472,62 @@ async function ensureAuthenticated() {
   });
 }
 
-async function applyInPageSearch(page, query) {
-  const selectors = [
+function resolveSection(input) {
+  if (!input) return DEFAULT_SECTION;
+
+  let value = String(input || '').trim();
+
+  try {
+    if (/^https?:\/\//i.test(value)) {
+      const url = new URL(value);
+      value = url.hash?.startsWith('#/') ? url.hash.slice(2) : url.pathname;
+    }
+  } catch {
+    // Usa value tal cual.
+  }
+
+  value = value.replace(/^#\/?/, '');
+  value = value.replace(/^\/+|\/+$/g, '');
+
+  const basePath = new URL(BASE_URL).pathname.replace(/^\/+|\/+$/g, '');
+  if (basePath && value.startsWith(basePath)) {
+    value = value.slice(basePath.length).replace(/^\/+/, '');
+  }
+
+  const key = normalizeKey(value);
+
+  if (!key) return DEFAULT_SECTION;
+  if (SECTION_ALIASES.has(key)) return SECTION_ALIASES.get(key);
+  if (UI_SECTIONS[key]) return key;
+
+  const parts = key.split('/').filter(Boolean);
+
+  if (parts[0] === 'inicio' && parts[1]) {
+    const second = normalizeKey(parts[1]);
+    if (SECTION_ALIASES.has(second)) return SECTION_ALIASES.get(second);
+    if (UI_SECTIONS[second]) return second;
+  }
+
+  if (parts[0] && UI_SECTIONS[parts[0]]) return parts[0];
+
+  return DEFAULT_SECTION;
+}
+
+async function findSearchInput(page, sectionName) {
+  const selectors = [];
+
+  if (sectionName === 'itinerarios') {
+    selectors.push(ITINERARIOS_SEARCH_SELECTOR);
+  }
+
+  selectors.push(
     'input[type="search"]',
     'input[placeholder*="buscar" i]',
     'input[aria-label*="buscar" i]',
     'input[placeholder*="filtrar" i]',
-    'input[aria-label*="filtrar" i]'
-  ];
+    'input[aria-label*="filtrar" i]',
+    'mat-form-field input'
+  );
 
   for (const selector of selectors) {
     const locator = page.locator(selector);
@@ -660,60 +538,49 @@ async function applyInPageSearch(page, query) {
       const visible = await input.isVisible().catch(() => false);
       const enabled = await input.isEnabled().catch(() => false);
 
-      if (!visible || !enabled) continue;
-
-      await input.fill(query);
-      await page.keyboard.press('Enter').catch(() => {});
-      await page.waitForTimeout(700);
-      await page.waitForTimeout(1500);
-
-      return true;
+      if (visible && enabled) {
+        return input;
+      }
     }
   }
 
-  return false;
+  return null;
 }
 
-async function fetchPage(urlOrPath, options = {}) {
+async function applyInPageSearch(page, query, sectionName) {
+  const input = await findSearchInput(page, sectionName);
+
+  if (!input) {
+    return false;
+  }
+
+  await input.fill('');
+  await input.fill(query);
+  await waitAfterUiAction(page, 1500);
+
+  return true;
+}
+
+async function fetchPageThroughUi(urlOrPath, options = {}) {
   return withPageLock(async () => {
-    let lastError = null;
+    await ensureAuthenticatedUnlocked();
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      await ensureAuthenticatedUnlocked();
+    const page = await getAppPage();
+    const sectionName = resolveSection(urlOrPath || options.section || DEFAULT_SECTION);
 
-      const page = await getAppPage();
+    await goToSectionThroughUiUnlocked(page, sectionName);
 
-      try {
-        await safeNavigate(
-          page,
-          urlOrPath || SEARCH_PATH || BASE_URL,
-          'la pagina solicitada'
-        );
-
-        if (options.searchQuery) {
-          await applyInPageSearch(page, options.searchQuery);
-        }
-
-        const finalUrl = page.url();
-        const html = await page.content();
-        const visibleText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
-
-        assertAccessiblePage(html, finalUrl);
-
-        return { html, finalUrl, visibleText };
-      } catch (error) {
-        lastError = error;
-
-        if (error?.code === 'AUTH_FAILED' && attempt === 0) {
-          authenticated = false;
-          continue;
-        }
-
-        throw error;
-      }
+    if (options.searchQuery) {
+      await applyInPageSearch(page, options.searchQuery, sectionName);
     }
 
-    throw lastError || createDetailedError('INTERNAL_ERROR', 'fallo desconocido al cargar pagina');
+    const finalUrl = page.url();
+    const html = await page.content();
+    const visibleText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+
+    assertAccessiblePage(html, finalUrl);
+
+    return { html, finalUrl, visibleText, sectionName };
   });
 }
 
@@ -730,21 +597,6 @@ function getSnippetAround(text, query, maxLength = 260) {
   const end = Math.min(normalizedText.length, index + normalizedQuery.length + 170);
 
   return summarizeText(normalizedText.slice(start, end), maxLength);
-}
-
-function buildSearchUrl(query, section) {
-  const baseSearch = section || SEARCH_PATH || '/inicio/itinerarios';
-
-  if (baseSearch.includes('{query}')) {
-    return baseSearch.replace('{query}', encodeURIComponent(query));
-  }
-
-  if (!SEARCH_APPEND_QUERY) {
-    return baseSearch;
-  }
-
-  const separator = baseSearch.includes('?') ? '&' : '?';
-  return `${baseSearch}${separator}q=${encodeURIComponent(query)}`;
 }
 
 function dedupeLinks(links) {
@@ -792,7 +644,7 @@ function extractReadableContent(html, pageUrl, visibleText = '') {
     if (!href || /^(javascript:|mailto:|tel:)/i.test(href)) return;
 
     try {
-      const url = normalizeUrl(href);
+      const url = new URL(href, pageUrl).toString();
       const origin = new URL(url).origin;
 
       if (TRUSTED_ORIGINS.includes(origin)) {
@@ -884,7 +736,7 @@ function createMcpServer() {
 
   server.tool(
     'search_pages',
-    'Busca contenido dentro de la web interna autenticada.',
+    'Busca contenido dentro de la web interna autenticada navegando por la interfaz.',
     {
       query: z.string(),
       limit: z.number().int().min(1).max(20).default(10),
@@ -892,16 +744,19 @@ function createMcpServer() {
     },
     async ({ query, limit, section }) => {
       try {
-        const searchUrl = buildSearchUrl(query, section);
-        const { html, finalUrl, visibleText } = await fetchPage(searchUrl, { searchQuery: query });
+        const { html, finalUrl, visibleText, sectionName } = await fetchPageThroughUi(
+          section || DEFAULT_SECTION,
+          { searchQuery: query, section }
+        );
+
         const extracted = extractReadableContent(html, finalUrl, visibleText);
         const results = [];
 
         if (extracted.contentText.toLowerCase().includes(query.toLowerCase())) {
           results.push({
-            title: extracted.title,
+            title: UI_SECTIONS[sectionName]?.title || extracted.title,
             url: finalUrl,
-            path: getDisplayPath(finalUrl),
+            path: sectionName,
             snippet: getSnippetAround(extracted.contentText, query),
             score: 1
           });
@@ -916,7 +771,7 @@ function createMcpServer() {
           results.push({
             title: link.label,
             url: link.url,
-            path: getDisplayPath(link.url),
+            path: new URL(link.url).pathname,
             snippet: link.label,
             score: 0.5
           });
@@ -929,7 +784,9 @@ function createMcpServer() {
               text: JSON.stringify({
                 results: results.slice(0, limit),
                 total: Math.min(results.length, limit),
-                searched_from: finalUrl
+                searched_from: finalUrl,
+                section: sectionName,
+                navigation_mode: 'ui'
               }, null, 2)
             }
           ]
@@ -942,16 +799,15 @@ function createMcpServer() {
 
   server.tool(
     'get_page',
-    'Obtiene una pagina concreta del sitio.',
+    'Obtiene una pantalla concreta navegando por la interfaz.',
     {
       url: z.string().optional(),
       path: z.string().optional()
     },
     async ({ url, path }) => {
       try {
-        if (!url && !path) throw new Error('INVALID_URL');
-
-        const { html, finalUrl, visibleText } = await fetchPage(url || path);
+        const target = url || path || DEFAULT_SECTION;
+        const { html, finalUrl, visibleText, sectionName } = await fetchPageThroughUi(target);
         const extracted = extractReadableContent(html, finalUrl, visibleText);
 
         return {
@@ -959,12 +815,13 @@ function createMcpServer() {
             {
               type: 'text',
               text: JSON.stringify({
-                title: extracted.title,
+                title: UI_SECTIONS[sectionName]?.title || extracted.title,
                 url: finalUrl,
-                path: getDisplayPath(finalUrl),
+                path: sectionName,
                 content_text: extracted.contentText,
-                content_markdown: `# ${extracted.title}\n\n${extracted.contentText}`,
-                links: extracted.links
+                content_markdown: `# ${UI_SECTIONS[sectionName]?.title || extracted.title}\n\n${extracted.contentText}`,
+                links: extracted.links,
+                navigation_mode: 'ui'
               }, null, 2)
             }
           ]
@@ -977,7 +834,7 @@ function createMcpServer() {
 
   server.tool(
     'extract_page_content',
-    'Extrae el contenido estructurado de una pagina.',
+    'Extrae contenido estructurado de una pantalla navegando por la interfaz.',
     {
       url: z.string(),
       include_tables: z.boolean().default(true),
@@ -985,7 +842,7 @@ function createMcpServer() {
     },
     async ({ url, include_tables, include_links }) => {
       try {
-        const { html, finalUrl, visibleText } = await fetchPage(url);
+        const { html, finalUrl, visibleText, sectionName } = await fetchPageThroughUi(url);
         const extracted = extractReadableContent(html, finalUrl, visibleText);
 
         return {
@@ -993,11 +850,13 @@ function createMcpServer() {
             {
               type: 'text',
               text: JSON.stringify({
-                title: extracted.title,
+                title: UI_SECTIONS[sectionName]?.title || extracted.title,
                 url: finalUrl,
+                path: sectionName,
                 sections: extracted.sections,
                 tables: include_tables ? extractTables(html) : [],
-                links: include_links ? extracted.links : []
+                links: include_links ? extracted.links : [],
+                navigation_mode: 'ui'
               }, null, 2)
             }
           ]
@@ -1010,19 +869,18 @@ function createMcpServer() {
 
   server.tool(
     'list_sections',
-    'Lista secciones navegables del sitio.',
+    'Lista secciones navegables de la interfaz.',
     {
-      root_path: z.string().default('/inicio/itinerarios')
+      root_path: z.string().default('/')
     },
-    async ({ root_path }) => {
+    async () => {
       try {
-        const { html, finalUrl, visibleText } = await fetchPage(root_path);
-        const extracted = extractReadableContent(html, finalUrl, visibleText);
+        await ensureAuthenticated();
 
-        const sections = extracted.links.map((link) => ({
-          title: link.label,
-          path: getDisplayPath(link.url),
-          url: link.url
+        const sections = Object.entries(UI_SECTIONS).map(([path, section]) => ({
+          title: section.title,
+          path,
+          navigation: 'menu_button'
         }));
 
         return {
@@ -1030,8 +888,8 @@ function createMcpServer() {
             {
               type: 'text',
               text: JSON.stringify({
-                root_url: finalUrl,
-                sections: dedupeLinks(sections).slice(0, 100)
+                sections,
+                navigation_mode: 'ui'
               }, null, 2)
             }
           ]
@@ -1091,7 +949,8 @@ async function startHttpServer() {
         base_url: BASE_URL,
         login_url: LOGIN_URL,
         current_url: page.url(),
-        search_path: normalizeUrl(SEARCH_PATH),
+        default_section: DEFAULT_SECTION,
+        navigation_mode: 'ui',
         mcp_path: MCP_PATH
       });
     } catch (error) {
@@ -1101,7 +960,8 @@ async function startHttpServer() {
         details: error?.details || null,
         base_url: BASE_URL,
         login_url: LOGIN_URL,
-        search_path: normalizeUrl(SEARCH_PATH),
+        default_section: DEFAULT_SECTION,
+        navigation_mode: 'ui',
         mcp_path: MCP_PATH
       });
     }
@@ -1112,7 +972,8 @@ async function startHttpServer() {
       name: 'ia-cae-zurekin-mcp',
       status: 'ok',
       endpoint: MCP_PATH,
-      healthcheck: '/health'
+      healthcheck: '/health',
+      navigation_mode: 'ui'
     });
   });
 
