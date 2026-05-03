@@ -93,10 +93,7 @@ function createDetailedError(code, message, details = {}) {
 }
 
 function summarizeText(text, maxLength = 500) {
-  return String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, maxLength);
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
 function normalizeKey(value) {
@@ -186,14 +183,26 @@ async function getBrowserContext() {
   if (!browser) {
     browser = await chromium.launch({
       headless: HEADLESS,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--no-first-run',
+        '--no-zygote'
+      ]
     });
   }
 
   if (!browserContext) {
     browserContext = await browser.newContext({
       ignoreHTTPSErrors: true,
-      viewport: { width: 1365, height: 900 }
+      viewport: { width: 1280, height: 800 }
     });
   }
 
@@ -204,6 +213,18 @@ async function newPage() {
   const context = await getBrowserContext();
   const page = await context.newPage();
   page.setDefaultTimeout(TIMEOUT_MS);
+
+  await page.route('**/*', async (route) => {
+    const type = route.request().resourceType();
+
+    if (['image', 'font', 'media'].includes(type)) {
+      await route.abort().catch(() => {});
+      return;
+    }
+
+    await route.continue().catch(() => {});
+  }).catch(() => {});
+
   return page;
 }
 
@@ -214,6 +235,28 @@ async function getAppPage() {
 
   appPage = await newPage();
   return appPage;
+}
+
+async function closeBrowser() {
+  if (appPage && !appPage.isClosed()) {
+    await appPage.close().catch(() => {});
+  }
+
+  appPage = null;
+
+  if (browserContext) {
+    await browserContext.close().catch(() => {});
+  }
+
+  browserContext = null;
+
+  if (browser) {
+    await browser.close().catch(() => {});
+  }
+
+  browser = null;
+  authenticated = false;
+  loginPromise = null;
 }
 
 async function withPageLock(task) {
@@ -253,9 +296,7 @@ async function isLoggedInPage(page) {
   }
 
   const menuCount = await page.locator(ITINERARIOS_MENU_SELECTOR).count().catch(() => 0);
-  if (menuCount > 0) return true;
-
-  return false;
+  return menuCount > 0;
 }
 
 async function clickSectionButton(page, sectionName) {
@@ -316,7 +357,7 @@ async function waitForSectionReady(page, sectionName) {
       .catch(() => {});
   }
 
-  await waitAfterUiAction(page, 1200);
+  await waitAfterUiAction(page, 1000);
 }
 
 async function goToSectionThroughUiUnlocked(page, sectionName = DEFAULT_SECTION) {
@@ -466,9 +507,14 @@ async function ensureAuthenticatedUnlocked() {
   await loginPromise;
 }
 
-async function ensureAuthenticated() {
+async function runUiSession(task) {
   return withPageLock(async () => {
-    await ensureAuthenticatedUnlocked();
+    try {
+      await ensureAuthenticatedUnlocked();
+      return await task(await getAppPage());
+    } finally {
+      await closeBrowser();
+    }
   });
 }
 
@@ -490,6 +536,7 @@ function resolveSection(input) {
   value = value.replace(/^\/+|\/+$/g, '');
 
   const basePath = new URL(BASE_URL).pathname.replace(/^\/+|\/+$/g, '');
+
   if (basePath && value.startsWith(basePath)) {
     value = value.slice(basePath.length).replace(/^\/+/, '');
   }
@@ -562,10 +609,7 @@ async function applyInPageSearch(page, query, sectionName) {
 }
 
 async function fetchPageThroughUi(urlOrPath, options = {}) {
-  return withPageLock(async () => {
-    await ensureAuthenticatedUnlocked();
-
-    const page = await getAppPage();
+  return runUiSession(async (page) => {
     const sectionName = resolveSection(urlOrPath || options.section || DEFAULT_SECTION);
 
     await goToSectionThroughUiUnlocked(page, sectionName);
@@ -875,8 +919,6 @@ function createMcpServer() {
     },
     async () => {
       try {
-        await ensureAuthenticated();
-
         const sections = Object.entries(UI_SECTIONS).map(([path, section]) => ({
           title: section.title,
           path,
@@ -939,16 +981,20 @@ async function startHttpServer() {
 
   app.get('/health', async (_req, res) => {
     try {
-      await ensureAuthenticated();
+      const result = await runUiSession(async (page) => {
+        await goToSectionThroughUiUnlocked(page, DEFAULT_SECTION);
 
-      const page = await getAppPage();
+        return {
+          current_url: page.url()
+        };
+      });
 
       res.json({
         ok: true,
         authenticated: true,
         base_url: BASE_URL,
         login_url: LOGIN_URL,
-        current_url: page.url(),
+        current_url: result.current_url,
         default_section: DEFAULT_SECTION,
         navigation_mode: 'ui',
         mcp_path: MCP_PATH
@@ -1074,23 +1120,6 @@ async function startHttpServer() {
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`IA CAE Zurekin MCP escuchando en http://0.0.0.0:${PORT}${MCP_PATH}`);
   });
-}
-
-async function closeBrowser() {
-  if (appPage && !appPage.isClosed()) {
-    await appPage.close().catch(() => {});
-  }
-
-  appPage = null;
-
-  if (browser) {
-    await browser.close().catch(() => {});
-  }
-
-  browser = null;
-  browserContext = null;
-  authenticated = false;
-  loginPromise = null;
 }
 
 process.on('SIGINT', async () => {
